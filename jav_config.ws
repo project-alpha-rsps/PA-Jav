@@ -1,10 +1,10 @@
 msg=
 title=Project-Alpha
 adverturl=
-codebase=http://test.project-alpha.dev/
+codebase=https://s3-client.project-alpha.dev/client/1.12.27-project-alpha.2/
 cachedir=.project-alpha
 storebase=0
-initial_jar=gamepack_238.jar
+initial_jar=client-shaded.jar
 initial_class=client.class
 termsurl=
 privacyurl=
@@ -25,7 +25,7 @@ param=13=.project-alpha.dev
 param=14=0
 param=15=0
 param=16=false
-param=17=http://test.project-alpha.dev:8765/world_list.ws
+param=17=https://worlds.project-alpha.dev/worlds.json
 param=18=
 param=19=196515767
 param=20=true
