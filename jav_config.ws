@@ -1,7 +1,7 @@
 msg=
 title=Project-Alpha
 adverturl=
-codebase=http://test.project-alpha.dev/
+codebase=https://world2.project-alpha.dev/
 cachedir=.project-alpha
 storebase=0
 initial_jar=gamepack_238.jar
@@ -20,12 +20,12 @@ param=8=true
 param=9=CzDLqS8eO0EPoFfZnMWR/xE1B0*zjnI/FsFNCJUCqrtqlUynHybjrxhFv6Ggwbv6fs4lfgiefhmLVBbvIJKDbPBL7hJW9LNsa8tBvqoRIOZ0Dz4PkaQOaUN*tCH0Ov9r8ABON/xoLZ*xCwHqwpDqbpTE3ePotA1zDtPM4IDcp/k=
 param=10=5
 param=11=https://auth.jagex.com/
-param=12=69
+param=12=2
 param=13=.project-alpha.dev
 param=14=0
 param=15=0
 param=16=false
-param=17=http://test.project-alpha.dev:8765/world_list.ws
+param=17=https://worlds.project-alpha.dev/worlds.json
 param=18=
 param=19=196515767
 param=20=true
