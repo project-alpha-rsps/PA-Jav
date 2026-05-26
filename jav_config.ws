@@ -1,10 +1,10 @@
 msg=
 title=Project-Alpha
 adverturl=
-codebase=https://s3-client.project-alpha.dev/client/1.12.27-project-alpha.2/
+codebase=http://test.project-alpha.dev/
 cachedir=.project-alpha
 storebase=0
-initial_jar=client-shaded.jar
+initial_jar=gamepack_238.jar
 initial_class=client.class
 termsurl=
 privacyurl=
