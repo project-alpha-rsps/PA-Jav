@@ -1,7 +1,7 @@
 msg=
 title=Project-Alpha
 adverturl=
-codebase=https://oldschool1.runescape.com/
+codebase=https://cdn.project-alpha.dev/
 cachedir=.project-alpha
 storebase=0
 initial_jar=gamepack_238.jar
