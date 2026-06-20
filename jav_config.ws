@@ -12,7 +12,7 @@ viewerclass=client.class
 param=1=1
 param=2=https://auth.jagex.com/
 param=3=true
-param=4=0
+param=4=1
 param=5=0
 param=6=0
 param=7=0
