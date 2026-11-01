@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -55,12 +57,60 @@ class JavConfigValidationTests(unittest.TestCase):
                     validator.parse_config(broken)
 
     def test_invalid_codebase_is_rejected(self) -> None:
-        with self.assertRaisesRegex(validator.ConfigError, "absolute URL"):
+        with self.assertRaisesRegex(validator.ConfigError, r"HTTP\(S\) URL"):
             validator.validate_file(ROOT / "tests" / "fixtures" / "incompatible-codebase.ws")
-        with self.assertRaisesRegex(validator.ConfigError, "absolute URL"):
+        with self.assertRaisesRegex(validator.ConfigError, r"HTTP\(S\) URL"):
             validator.parse_config(
                 "codebase=http://[\ninitial_jar=gamepack.jar\ninitial_class=client.class"
             )
+
+    def test_unknown_scheme_is_rejected(self) -> None:
+        with self.assertRaisesRegex(validator.ConfigError, r"HTTP\(S\) URL"):
+            validator.validate_file(ROOT / "tests" / "fixtures" / "unknown-codebase-scheme.ws")
+
+    def test_malformed_or_out_of_range_port_is_rejected(self) -> None:
+        for codebase in (
+            "http://fixture.invalid:not-a-port/",
+            "http://fixture.invalid:65536/",
+            "http://fixture.invalid:/",
+            "http://fixture..invalid/",
+            "http://not a host/",
+            " http://fixture.invalid/",
+        ):
+            with self.subTest(codebase=codebase):
+                with self.assertRaisesRegex(validator.ConfigError, r"HTTP\(S\) URL"):
+                    validator.parse_config(
+                        f"codebase={codebase}\ninitial_jar=gamepack.jar\ninitial_class=client.class"
+                    )
+
+    def test_http_and_https_with_valid_hosts_and_ports_are_accepted(self) -> None:
+        for codebase in (
+            "http://fixture.invalid/",
+            "https://fixture.invalid:443/",
+            "http://127.0.0.1:8080/",
+            "https://[::1]:443/",
+        ):
+            with self.subTest(codebase=codebase):
+                validator.parse_config(
+                    f"codebase={codebase}\ninitial_jar=gamepack.jar\ninitial_class=client.class"
+                )
+
+    def test_invalid_authority_fixtures_report_validation_errors_without_tracebacks(self) -> None:
+        for name in ("unknown-codebase-scheme.ws", "malformed-codebase-port.ws"):
+            with self.subTest(name=name):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        str(ROOT / "scripts" / "validate-jav-config.py"),
+                        str(ROOT / "tests" / "fixtures" / name),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("FAIL ", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_non_assignment_line_is_rejected(self) -> None:
         with self.assertRaisesRegex(validator.ConfigError, "expected key=value"):

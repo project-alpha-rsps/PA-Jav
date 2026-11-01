@@ -4,14 +4,17 @@
 The accepted structure follows ClientConfigLoader.fetch in the Project Alpha
 client: ordinary values use key=value, applet values use param=key=value, and
 the loader requires non-empty codebase, initial_jar, and initial_class values.
-RSAppletStub constructs a java.net.URL from codebase, so it must be an absolute
-URL with an authority. This checks syntax and consumer compatibility only; it
-does not launch a client or check live endpoint behavior.
+RSAppletStub constructs a java.net.URL from codebase. The supported client
+contract is an absolute HTTP(S) URL with a syntactically valid host and port.
+This checks syntax and consumer compatibility only; it does not launch a client
+or check live endpoint behavior.
 """
 
 from __future__ import annotations
 
 import argparse
+import ipaddress
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -23,6 +26,60 @@ REQUIRED_FIELDS = ("codebase", "initial_jar", "initial_class")
 class ConfigError(ValueError):
     """A Jav config cannot be consumed by the client startup loader."""
 
+
+def validate_codebase(codebase: str, source: str) -> None:
+    message = f"{source}: codebase must be an absolute HTTP(S) URL with a valid host and port"
+    if not codebase or codebase != codebase.strip():
+        raise ConfigError(message)
+    try:
+        parsed_url = urlsplit(codebase)
+        parsed_url.port  # Validate numeric syntax and the 0..65535 range.
+    except ValueError:
+        raise ConfigError(message) from None
+
+    if parsed_url.scheme.lower() not in ("http", "https") or not parsed_url.netloc:
+        raise ConfigError(message)
+
+    authority = parsed_url.netloc.rsplit("@", 1)[-1]
+    if authority.startswith("["):
+        closing_bracket = authority.find("]")
+        if closing_bracket < 0:
+            raise ConfigError(message)
+        suffix = authority[closing_bracket + 1 :]
+        if suffix and (
+            not suffix.startswith(":") or not suffix[1:].isascii() or not suffix[1:].isdigit()
+        ):
+            raise ConfigError(message)
+        if suffix == ":":
+            raise ConfigError(message)
+    elif ":" in authority:
+        host_part, supplied_port = authority.rsplit(":", 1)
+        if ":" in host_part or not supplied_port.isascii() or not supplied_port.isdigit():
+            raise ConfigError(message)
+
+    host = parsed_url.hostname
+    if not host:
+        raise ConfigError(message)
+    try:
+        if ":" in host:
+            ipaddress.IPv6Address(host)
+        else:
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                ascii_host = host.encode("idna").decode("ascii")
+                dns_host = ascii_host[:-1] if ascii_host.endswith(".") else ascii_host
+                if not dns_host or len(dns_host) > 253:
+                    raise ValueError
+                labels = dns_host.split(".")
+                if not labels or any(
+                    len(label) > 63
+                    or re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?", label) is None
+                    for label in labels
+                ):
+                    raise ValueError
+    except (UnicodeError, ValueError):
+        raise ConfigError(message) from None
 
 def parse_config(text: str, source: str = "<config>") -> tuple[dict[str, str], dict[str, str]]:
     class_loader: dict[str, str] = {}
@@ -56,13 +113,7 @@ def parse_config(text: str, source: str = "<config>") -> tuple[dict[str, str], d
         if not class_loader.get(field):
             raise ConfigError(f"{source}: required client field '{field}' is missing or empty")
 
-    codebase = class_loader["codebase"]
-    try:
-        parsed_url = urlsplit(codebase)
-    except ValueError:
-        raise ConfigError(f"{source}: codebase must be an absolute URL with an authority") from None
-    if not parsed_url.scheme or not parsed_url.netloc:
-        raise ConfigError("{}: codebase must be an absolute URL with an authority".format(source))
+    validate_codebase(class_loader["codebase"], source)
 
     return class_loader, applet
 

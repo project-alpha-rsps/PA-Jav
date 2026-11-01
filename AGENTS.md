@@ -52,8 +52,9 @@ Run `actionlint`, `zizmor --offline .github/workflows/`,
 checks the current desktop and mobile configs, while
 `python3 -m unittest discover -s tests -p 'test_*.py'` exercises synthetic
 syntax and consumer-compatibility fixtures. These checks validate configuration
-syntax and fields consumed by the desktop client's startup loader; they do not
-launch either client.
+syntax, the desktop client's required fields, and an absolute HTTP(S)
+`codebase` with a non-empty valid host/authority and a valid numeric port when
+supplied; they do not launch either client or make network requests.
 
 ## Change workflow
 
