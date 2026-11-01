@@ -1,0 +1,40 @@
+name: Jav config validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Jav configs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate desktop config
+        run: python3 scripts/validate-jav-config.py jav_config.ws
+
+      - name: Validate mobile config
+        run: python3 scripts/validate-jav-config.py jav_config_mobile.ws
+
+      - name: Test synthetic syntax and compatibility fixtures
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Report scope
+        if: always()
+        run: |
+          {
+            echo '## Jav config validation'
+            echo '- Desktop and mobile config syntax plus client startup fields are validated.'
+            echo '- Synthetic fixtures cover valid desktop/mobile variants, malformed parameter syntax, missing required fields, and incompatible codebase URLs.'
+            echo '- This check does not launch the client or verify live endpoint behavior.'
+          } >> "$GITHUB_STEP_SUMMARY"

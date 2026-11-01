@@ -48,7 +48,12 @@ non-hooked tool.
 
 Run `actionlint`, `zizmor --offline .github/workflows/`,
 `shellcheck .claude/hooks/*.sh`, `python3 scripts/check-agent-policy.py`, and
-`python3 scripts/test-agent-hooks.py` in CI. There is no Jav build validator.
+`python3 scripts/test-agent-hooks.py` in CI. `python3 scripts/validate-jav-config.py`
+checks the current desktop and mobile configs, while
+`python3 -m unittest discover -s tests -p 'test_*.py'` exercises synthetic
+syntax and consumer-compatibility fixtures. These checks validate configuration
+syntax and fields consumed by the desktop client's startup loader; they do not
+launch either client.
 
 ## Change workflow
 
