@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "autoMemoryEnabled": false,
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  },
+  "permissions": {
+    "allow": [
+      "Bash(gh *)",
+      "Bash(git commit *)",
+      "Bash(git push *)",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Read",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
+    ],
+    "deny": [
+      "Bash(flux *)",
+      "Bash(helm *)",
+      "Bash(kubectl *)",
+      "Bash(sops *)",
+      "Bash(talosctl *)",
+      "CronCreate",
+      "Monitor",
+      "Read(./**/*.agekey)",
+      "Read(./**/*.env)",
+      "Read(./**/*.env.*)",
+      "Read(./**/*.key)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.tfvars)",
+      "Read(./**/kubeconfig)",
+      "Read(./**/talosconfig)",
+      "Read(./**/terraform.tfstate*)",
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./.mcp.json)",
+      "Read(./.private/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.config/gh/**)",
+      "Read(~/.config/sops/age/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.ssh/**)",
+      "RemoteTrigger",
+      "ScheduleWakeup"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-runtime.sh\"",
+            "onFailure": "block"
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-git-unsafe.sh\"",
+            "onFailure": "block"
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-gh-unsafe.sh\"",
+            "onFailure": "block"
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-attribution.sh\"",
+            "onFailure": "block"
+          },
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/require-validation-before-git.sh\"",
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-config-commentary.sh\"",
+            "onFailure": "block"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Write|Edit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/probity.sh\"",
+            "onFailure": "block",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_DISABLE_CRON": "1"
+  }
+}

@@ -1,0 +1,9 @@
+# The hook suite imports this library, and CPython caches compiled modules
+# beside the source. Those artefacts are interpreter- and architecture-specific
+# and stale the moment the .py changes, so they never belong in git.
+#
+# scripts/test-agent-hooks.py also sets sys.dont_write_bytecode and exports
+# PYTHONDONTWRITEBYTECODE=1, which stops them being created at all. This file
+# is the second line of defence, for anyone who imports the library another way.
+__pycache__/
+*.py[cod]

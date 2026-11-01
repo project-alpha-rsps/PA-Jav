@@ -1,0 +1,68 @@
+name: Repo policy lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install tools from mise
+        uses: jdx/mise-action@9e7f7633ff6f6d6048a9418a68d48f288f50eb14 # v4.2.3
+
+      - name: actionlint
+        run: actionlint
+
+      - name: zizmor
+        run: zizmor --offline .github/workflows/
+
+      - name: shellcheck
+        run: shellcheck .claude/hooks/*.sh
+
+      - name: gitleaks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          AFTER_SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then
+            range="$BASE_SHA..$HEAD_SHA"
+          else
+            range="$BEFORE_SHA..$AFTER_SHA"
+          fi
+          gitleaks git . --log-opts="$range" --redact --exit-code 1
+
+      - name: Check agent policy
+        run: python3 scripts/check-agent-policy.py
+
+      - name: Detect hook-suite changes
+        id: hook-suite-changes
+        env:
+          BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          changed="$(git diff --name-only "${BASE_SHA}..${HEAD_SHA}")"
+          if printf '%s\n' "$changed" | grep -Eq '(^\.claude/|^scripts/test-agent-hooks\.py$)'; then
+            echo "run_tests=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_tests=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Test agent hooks
+        if: steps.hook-suite-changes.outputs.run_tests == 'true'
+        run: python3 scripts/test-agent-hooks.py

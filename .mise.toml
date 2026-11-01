@@ -1,0 +1,6 @@
+[tools]
+"aqua:rhysd/actionlint" = "1.7.7"
+"aqua:zizmorcore/zizmor" = "1.12.1"
+"aqua:koalaman/shellcheck" = "0.10.0"
+"aqua:gitleaks/gitleaks" = "8.24.2"
+"python" = "3.14.7"
