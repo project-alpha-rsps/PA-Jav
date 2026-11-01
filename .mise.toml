@@ -1,0 +1,6 @@
+[tools]
+actionlint = "latest"
+zizmor = "latest"
+shellcheck = "latest"
+gitleaks = "latest"
+python = "latest"

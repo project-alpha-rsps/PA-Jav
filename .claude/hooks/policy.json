@@ -1,0 +1,25 @@
+{
+  "repository": "Public repository containing the Jav client configuration files.",
+  "blockedCommands": {
+    "kubectl": "kubectl is blocked. Persistent Kubernetes changes flow through Git and Flux in shockstruck/k8s-gitops, not from a shell in this repository.",
+    "flux": "flux CLI is blocked. Reconciliation is k8s-gitops' concern and needs scoped approval there.",
+    "helm": "helm is blocked. Edit the HelmRelease in shockstruck/k8s-gitops; do not bypass Flux.",
+    "talosctl": "talosctl is blocked. Talos changes are Git-reviewed and applied only with explicit operator approval and a rollback.",
+    "sops": "sops is blocked. Do not decrypt or print secret material in an agent session."
+  },
+  "taskIdentifiers": {
+    "prefixes": ["SHOC", "PRO", "MUL"],
+    "paths": ["**"]
+  },
+  "comments": {
+    "paths": [],
+    "suffixes": [".yaml", ".yml", ".toml", ".ini", ".conf", ".tf", ".tfvars", ".hcl"],
+    "directives": ["yaml-language-server:", "renovate:"],
+    "excludedPaths": [],
+    "guidance": ""
+  },
+  "validation": {
+    "commandPattern": "",
+    "hint": ""
+  }
+}
