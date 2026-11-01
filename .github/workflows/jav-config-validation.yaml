@@ -21,6 +21,9 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
+      - name: Fetch exact known-good rollback commit
+        run: git fetch --no-tags --depth=1 origin 004b007b785b342dcc7c738019963690ae2ae21e
+
       - name: Validate desktop config
         run: python3 scripts/validate-jav-config.py jav_config.ws
 
@@ -30,13 +33,10 @@ jobs:
       - name: Test synthetic syntax and compatibility fixtures
         run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
-      - name: Check out canonical release-manifest validator
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-        with:
-          repository: project-alpha-rsps/server
-          ref: 0a205b8bd9f352b90e6e970e2660a42e9c50224b
-          path: .manifest-validator
-          persist-credentials: false
+      - name: Verify byte-identical offline manifest mirror
+        run: |
+          echo '67ac06444c93598d1a94c338808f4d93fb3c8134d1f5ca0dea38aaf915797773  tools/manifest-mirror/v1/schema.json' | sha256sum --check
+          echo '7e1aa8590b85afcb3c41783810fe8a744a3f6da510794dc4e3483a71f6078125  tools/manifest-mirror/v1/validate.py' | sha256sum --check
 
       - name: Generate and validate immutable config candidate
         env:
@@ -52,7 +52,7 @@ jobs:
             --run-id "$GITHUB_RUN_ID" \
             --builder github-actions \
             --output "$RUNNER_TEMP/jav-candidate.json"
-          python3 .manifest-validator/tools/release-manifest/v1/validate.py "$RUNNER_TEMP/jav-candidate.json"
+          python3 tools/manifest-mirror/v1/validate.py "$RUNNER_TEMP/jav-candidate.json"
 
       - name: Report scope
         if: always()
@@ -61,7 +61,7 @@ jobs:
             echo '## Jav config validation'
             echo '- Desktop and mobile config syntax plus client startup fields are validated.'
             echo '- Synthetic fixtures cover valid desktop/mobile variants, malformed parameter syntax, missing required fields, and incompatible codebase URLs.'
-            echo '- Candidate records pin the source SHA, both config hashes, client-config compatibility evidence, and prior config artifacts; the canonical server manifest validator checks the record.'
+            echo '- Candidate records pin the source SHA, both config hashes, client and canonical manifest inputs, and prior config artifacts; an offline byte-identical mirror of the server-owned validator checks the record.'
             echo '- Candidate generation and validation do not publish config files or assert consumer startup.'
             echo '- This check does not launch the client or verify live endpoint behavior.'
           } >> "$GITHUB_STEP_SUMMARY"

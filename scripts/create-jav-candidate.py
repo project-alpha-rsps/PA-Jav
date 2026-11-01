@@ -16,6 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_URI = "https://github.com/project-alpha-rsps/PA-Jav"
 CONFIGS = ("jav_config.ws", "jav_config_mobile.ws")
 SHA_PATTERN = re.compile(r"^(?:[a-f0-9]{40}|[a-f0-9]{64})$")
+CLIENT_CONTRACT_SHA = "73ceac2e6ed3939e604dfc6a9f7e58230ca6b7a4"
+MANIFEST_SOURCE_SHA = "0a205b8bd9f352b90e6e970e2660a42e9c50224b"
 
 
 class CandidateError(ValueError):
@@ -42,7 +44,7 @@ def make_artifact(name: str, sha: str, content: bytes) -> dict[str, str]:
     return {
         "name": name,
         "kind": "config",
-        "uri": f"{REPOSITORY_URI}/blob/{sha}/{name}",
+        "uri": f"https://raw.githubusercontent.com/project-alpha-rsps/PA-Jav/{sha}/{name}",
         "digest": f"sha256:{digest}",
     }
 
@@ -56,6 +58,7 @@ def create_candidate(
     if source_sha == rollback_sha:
         raise CandidateError("source and rollback SHAs must identify different candidates")
     git_bytes("cat-file", "-e", f"{source_sha}^{{commit}}")
+    git_bytes("cat-file", "-e", f"{rollback_sha}^{{commit}}")
     source_artifacts = []
     rollback_artifacts = []
     for name in CONFIGS:
@@ -74,7 +77,18 @@ def create_candidate(
         "schemaVersion": "1.0.0",
         "candidateId": candidate_id,
         "source": {"name": "project-alpha-rsps/PA-Jav", "uri": REPOSITORY_URI, "sha": source_sha},
-        "inputs": [],
+        "inputs": [
+            {
+                "name": "project-alpha-rsps/client-startup-contract",
+                "uri": "https://github.com/project-alpha-rsps/client",
+                "sha": CLIENT_CONTRACT_SHA,
+            },
+            {
+                "name": "project-alpha-rsps/server-release-manifest",
+                "uri": "https://github.com/project-alpha-rsps/server",
+                "sha": MANIFEST_SOURCE_SHA,
+            },
+        ],
         "artifacts": source_artifacts,
         "build": {
             "provider": "GitHub Actions",
@@ -88,12 +102,12 @@ def create_candidate(
             "protocol": {"status": "not_applicable"},
             "config": {
                 "status": "verified",
-                "value": "PA-Jav validator and synthetic tests accept the client startup fields and HTTP(S) codebase contract",
+                "value": f"PA-Jav syntax and startup-field contract tested against client source {CLIENT_CONTRACT_SHA}; live startup is not asserted",
                 "evidence": [evidence_uri],
             },
             "migration": {"status": "not_applicable"},
             "minimumLauncherVersion": {"status": "not_applicable"},
-            "minimumClientVersion": {"status": "not_applicable"},
+            "minimumClientVersion": {"status": "unverified"},
         },
         "environment": "development",
         "rollback": {"knownGoodCandidateId": f"pa-jav-{rollback_sha}", "artifacts": rollback_artifacts},

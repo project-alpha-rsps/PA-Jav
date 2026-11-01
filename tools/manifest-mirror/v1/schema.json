@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://project-alpha.dev/schemas/release-manifest/v1/schema.json",
+  "title": "Project Alpha release candidate manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "candidateId", "source", "inputs", "artifacts", "build", "verification", "compatibility", "environment", "rollback"],
+  "properties": {
+    "schemaVersion": {"const": "1.0.0"},
+    "candidateId": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$"},
+    "source": {"$ref": "#/$defs/repository"},
+    "inputs": {"type": "array", "items": {"$ref": "#/$defs/repository"}, "uniqueItems": true},
+    "artifacts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}},
+    "build": {
+      "type": "object", "additionalProperties": false,
+      "required": ["provider", "pipeline", "runId", "builder"],
+      "properties": {
+        "provider": {"type": "string", "minLength": 1},
+        "pipeline": {"type": "string", "minLength": 1},
+        "runId": {"type": "string", "minLength": 1},
+        "builder": {"type": "string", "minLength": 1}
+      }
+    },
+    "verification": {"$ref": "#/$defs/verification"},
+    "compatibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["cache", "protocol", "config", "migration", "minimumLauncherVersion", "minimumClientVersion"],
+      "properties": {
+        "cache": {"$ref": "#/$defs/compatibilityState"},
+        "protocol": {"$ref": "#/$defs/compatibilityState"},
+        "config": {"$ref": "#/$defs/compatibilityState"},
+        "migration": {"$ref": "#/$defs/compatibilityState"},
+        "minimumLauncherVersion": {"$ref": "#/$defs/compatibilityState"},
+        "minimumClientVersion": {"$ref": "#/$defs/compatibilityState"}
+      }
+    },
+    "environment": {"type": "string", "enum": ["development", "staging", "production", "rollback"]},
+    "rollback": {
+      "type": "object", "additionalProperties": false,
+      "required": ["knownGoodCandidateId", "artifacts"],
+      "properties": {
+        "knownGoodCandidateId": {"type": "string", "minLength": 1},
+        "artifacts": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/artifact"}}
+      }
+    }
+  },
+  "$defs": {
+    "repository": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "uri", "sha"],
+      "properties": {
+        "name": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$"},
+        "uri": {"type": "string", "format": "uri"},
+        "sha": {"type": "string", "pattern": "^(?:[a-f0-9]{40}|[a-f0-9]{64})$"}
+      }
+    },
+    "artifact": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "uri", "digest"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "kind": {"type": "string", "enum": ["container", "signed-client", "signed-launcher", "mobile", "config", "other"]},
+        "uri": {"type": "string", "format": "uri"},
+        "digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "signature": {"$ref": "#/$defs/signature"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "container"}}, "required": ["kind"]},
+          "then": {"properties": {"uri": {"pattern": "^oci://[^/?#@]+/[A-Za-z0-9][A-Za-z0-9._/-]*@sha256:[a-f0-9]{64}$"}}}
+        },
+        {
+          "if": {"properties": {"kind": {"enum": ["signed-client", "signed-launcher"]}}, "required": ["kind"]},
+          "then": {"required": ["signature"]}
+        }
+      ]
+    },
+    "signature": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "evidence"],
+      "properties": {
+        "status": {"type": "string", "enum": ["verified", "unverified", "not_applicable"]},
+        "evidence": {"type": "array", "items": {"type": "string", "format": "uri"}}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "verified"}}, "required": ["status"]},
+        "then": {"properties": {"evidence": {"minItems": 1}}}
+      }]
+    },
+    "verification": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status", "evidence"],
+      "properties": {
+        "status": {"type": "string", "enum": ["verified", "unverified", "not_applicable"]},
+        "evidence": {"type": "array", "items": {"type": "string", "format": "uri"}}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "verified"}}, "required": ["status"]},
+        "then": {"properties": {"evidence": {"minItems": 1}}}
+      }]
+    },
+    "compatibilityState": {
+      "type": "object", "additionalProperties": false,
+      "required": ["status"],
+      "properties": {
+        "status": {"type": "string", "enum": ["verified", "unverified", "not_applicable"]},
+        "value": {"type": "string", "minLength": 1},
+        "evidence": {"type": "array", "items": {"type": "string", "format": "uri"}}
+      },
+      "allOf": [{
+        "if": {"properties": {"status": {"const": "verified"}}, "required": ["status"]},
+        "then": {
+          "required": ["value", "evidence"],
+          "properties": {"evidence": {"minItems": 1}}
+        },
+        "else": {"not": {"required": ["value"]}}
+      }]
+    }
+  }
+}
