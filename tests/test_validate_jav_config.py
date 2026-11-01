@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import subprocess
 import sys
@@ -14,9 +15,102 @@ MODULE_SPEC = importlib.util.spec_from_file_location(
 assert MODULE_SPEC and MODULE_SPEC.loader
 validator = importlib.util.module_from_spec(MODULE_SPEC)
 MODULE_SPEC.loader.exec_module(validator)
+CANDIDATE_SPEC = importlib.util.spec_from_file_location(
+    "create_jav_candidate", ROOT / "scripts" / "create-jav-candidate.py"
+)
+assert CANDIDATE_SPEC and CANDIDATE_SPEC.loader
+candidate_tool = importlib.util.module_from_spec(CANDIDATE_SPEC)
+CANDIDATE_SPEC.loader.exec_module(candidate_tool)
 
 
 class JavConfigValidationTests(unittest.TestCase):
+    def test_candidate_pins_source_config_hashes_compatibility_and_rollback(self) -> None:
+        source_sha = "a" * 40
+        rollback_sha = "b" * 40
+        original = candidate_tool.git_bytes
+        candidate_tool.git_bytes = lambda *args: (
+            b"" if args[0] == "cat-file" else
+            b"prior config\n" if args[1].startswith(f"{rollback_sha}:") else
+            (ROOT / args[1].split(":", 1)[1]).read_bytes()
+        )
+        try:
+            manifest = candidate_tool.create_candidate(
+                source_sha=source_sha,
+                rollback_sha=rollback_sha,
+                candidate_id=f"pa-jav-{source_sha}",
+                evidence_uri="https://github.example.invalid/actions/runs/1",
+                run_id="1",
+                builder="fixture",
+            )
+        finally:
+            candidate_tool.git_bytes = original
+
+        self.assertEqual(manifest["source"]["sha"], source_sha)
+        self.assertEqual(manifest["rollback"]["knownGoodCandidateId"], f"pa-jav-{rollback_sha}")
+        self.assertEqual(len(manifest["artifacts"]), 2)
+        for artifact in manifest["artifacts"]:
+            config_bytes = (ROOT / artifact["name"]).read_bytes()
+            self.assertEqual(artifact["digest"], f"sha256:{hashlib.sha256(config_bytes).hexdigest()}")
+            self.assertEqual(
+                artifact["uri"],
+                f"https://raw.githubusercontent.com/project-alpha-rsps/PA-Jav/{source_sha}/{artifact['name']}",
+            )
+        for artifact in manifest["rollback"]["artifacts"]:
+            self.assertEqual(artifact["digest"], f"sha256:{hashlib.sha256(b'prior config\n').hexdigest()}")
+            self.assertEqual(
+                artifact["uri"],
+                f"https://raw.githubusercontent.com/project-alpha-rsps/PA-Jav/{rollback_sha}/{artifact['name']}",
+            )
+        self.assertEqual(
+            manifest["inputs"],
+            [
+                {
+                    "name": "project-alpha-rsps/client-startup-contract",
+                    "uri": "https://github.com/project-alpha-rsps/client",
+                    "sha": "73ceac2e6ed3939e604dfc6a9f7e58230ca6b7a4",
+                },
+                {
+                    "name": "project-alpha-rsps/server-release-manifest",
+                    "uri": "https://github.com/project-alpha-rsps/server",
+                    "sha": "0a205b8bd9f352b90e6e970e2660a42e9c50224b",
+                },
+            ],
+        )
+        self.assertEqual(manifest["compatibility"]["config"]["status"], "verified")
+        self.assertEqual(manifest["compatibility"]["minimumClientVersion"]["status"], "unverified")
+
+    def test_real_candidate_generation_resolves_source_and_rollback_commits(self) -> None:
+        source_sha = candidate_tool.git_bytes("rev-parse", "HEAD").decode().strip()
+        manifest = candidate_tool.create_candidate(
+            source_sha=source_sha,
+            rollback_sha="004b007b785b342dcc7c738019963690ae2ae21e",
+            candidate_id=f"pa-jav-{source_sha}",
+            evidence_uri="https://github.example.invalid/actions/runs/1",
+            run_id="fixture-run",
+            builder="fixture",
+        )
+        self.assertEqual(manifest["source"]["sha"], source_sha)
+        self.assertEqual(len(manifest["rollback"]["artifacts"]), 2)
+
+    def test_candidate_rejects_unavailable_and_noncommit_rollback_shas(self) -> None:
+        source_sha = candidate_tool.git_bytes("rev-parse", "HEAD").decode().strip()
+        tree_sha = candidate_tool.git_bytes("rev-parse", "HEAD^{tree}").decode().strip()
+        for rollback_sha in ("f" * 40, tree_sha):
+            with self.subTest(rollback_sha=rollback_sha):
+                with self.assertRaisesRegex(candidate_tool.CandidateError, "resolve"):
+                    candidate_tool.create_candidate(
+                        source_sha=source_sha,
+                        rollback_sha=rollback_sha,
+                        candidate_id=f"pa-jav-{source_sha}",
+                        evidence_uri="https://github.example.invalid/actions/runs/1",
+                        run_id="fixture-run",
+                        builder="fixture",
+                    )
+
+    def test_candidate_rejects_abbreviated_source_and_rollback_shas(self) -> None:
+        with self.assertRaisesRegex(candidate_tool.CandidateError, "full lowercase"):
+            candidate_tool.require_sha("004b007", "source SHA")
+
     def test_synthetic_desktop_and_mobile_configs_are_accepted(self) -> None:
         for name in ("desktop-valid.ws", "mobile-valid.ws"):
             with self.subTest(name=name):
