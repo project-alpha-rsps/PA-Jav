@@ -248,7 +248,9 @@ for args in gh_merge_invocations:
             "itself, appending a `Co-authored-by` trailer for every commit author on the branch. "
             'Allowed next step: when your role permits merging and review gates are met, supply '
             'the message explicitly: `gh pr merge <n> --squash --subject "<title> (#<n>)" '
-            '--body "<body>"`; otherwise hand the PR to its merging owner.'
+            '--body "<body>"` by default, or `gh pr merge <n> --rebase --match-head-commit <sha> '
+            '--body "<title> (#<n>)"` where the repository disables or forbids squash; otherwise '
+            'hand the PR to its merging owner.'
         )
 
 owner_domain = os.environ.get("GIT_AUTHOR_EMAIL") or os.environ.get("GIT_COMMITTER_EMAIL") or ""
