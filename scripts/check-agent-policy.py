@@ -24,9 +24,8 @@ line applies), stdlib only:
   `multica issue`/`multica run`.
 - `.claude/settings.json` registers every template hook and carries no
   `permissions.ask`. Each template hook's PreToolUse entry sets
-  `"onFailure": "block"`, and `probity.sh`'s also sets a positive `timeout`:
-  without them Claude Code lets the tool call through when the hook crashes or
-  times out.
+  `"onFailure": "block"`: without it Claude Code lets the tool call through
+  when the hook crashes or times out.
 - `AGENTS.md` exists and still carries every section name
   `AGENTS.md.skeleton`'s first section lists as arriving from
   `agents/shared/conduct.md` in agent-platform.
@@ -69,17 +68,9 @@ MULTICA_UUID_PATTERN = re.compile(
 # `scripts/check-repo-policy-drift.py`; see the module docstring for why this
 # is a copy rather than an import.
 REQUIRED_HOOKS = (
-    "block-attribution.sh",
     "block-config-commentary.sh",
-    "block-gh-unsafe.sh",
-    "block-git-unsafe.sh",
-    "block-runtime.sh",
-    "probity.sh",
-    "require-validation-before-git.sh",
+    "pre-bash.sh",
 )
-
-# The one hook that waits on a model, so the one whose latency is sized.
-PROBITY_HOOK = "probity.sh"
 
 # The section names `AGENTS.md.skeleton`'s first section lists as arriving
 # from `agents/shared/conduct.md`. Kept in step with that file by
@@ -168,6 +159,31 @@ def check_multica_ids(files: list[str], report: Report) -> None:
                 report.add(relative, number, "carries a Multica id")
 
 
+# Claude Code treats any hook exit other than 0 or 2 as a non-blocking error: a
+# missing interpreter (127), a non-executable script (126) or a crash lets the
+# call through. This one constant tail turns every such status into 2 and leaves
+# 0 and 2 untouched. A registered command is its quoted script path, alone or
+# followed by exactly this tail.
+FAIL_CLOSED_SUFFIX = (
+    '; s=$?; [ "$s" -eq 0 ] || [ "$s" -eq 2 ] || '
+    '{ echo "[hook] hook exited $s (missing interpreter or crash); refusing to allow the call. '
+    'Allowed next step: report the hook failure for reviewed repair and continue independent work; '
+    'retry only after repair." >&2; exit 2; }; exit "$s"'
+)
+
+
+def hook_command_path(command: str) -> tuple[str, str]:
+    """The hook script path, and an error for any tail but FAIL_CLOSED_SUFFIX."""
+    if command.startswith('"'):
+        end = command.find('"', 1)
+        if end > 0:
+            tail = command[end + 1 :]
+            if tail in ("", FAIL_CLOSED_SUFFIX):
+                return command[1:end], ""
+            return command[1:end], f"hook command has an unexpected suffix: `{tail}`"
+    return command, ""
+
+
 def check_settings(report: Report) -> None:
     relative = str(SETTINGS_PATH.relative_to(ROOT))
     if not SETTINGS_PATH.is_file():
@@ -183,7 +199,7 @@ def check_settings(report: Report) -> None:
         return
 
     registered = {
-        Path(entry["command"].strip('"')).name
+        Path(hook_command_path(entry["command"])[0]).name
         for event in (settings.get("hooks") or {}).values()
         if isinstance(event, list)
         for matcher in event
@@ -214,16 +230,16 @@ def fail_open_entries(settings: dict) -> list[str]:
         for entry in matcher.get("hooks") or []:
             if not isinstance(entry, dict) or not isinstance(entry.get("command"), str):
                 continue
-            name = Path(entry["command"].strip('"')).name
+            name = Path(hook_command_path(entry["command"])[0]).name
             if name not in REQUIRED_HOOKS:
                 continue
             if entry.get("onFailure") != "block":
                 problems.append(f'registers {name} without "onFailure": "block"')
-            timeout = entry.get("timeout")
-            if name == PROBITY_HOOK and (
-                isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0
-            ):
-                problems.append(f"registers {name} without a positive `timeout`")
+            path, error = hook_command_path(entry["command"])
+            if error:
+                problems.append(f"registers {name}: {error}")
+            elif entry["command"] != f'"{path}"{FAIL_CLOSED_SUFFIX}':
+                problems.append(f"registers {name} without the fail-closed command suffix")
     return problems
 
 

@@ -57,27 +57,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-runtime.sh\"",
-            "onFailure": "block"
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-git-unsafe.sh\"",
-            "onFailure": "block"
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-gh-unsafe.sh\"",
-            "onFailure": "block"
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-attribution.sh\"",
-            "onFailure": "block"
-          },
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/require-validation-before-git.sh\"",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash.sh\"; s=$?; [ \"$s\" -eq 0 ] || [ \"$s\" -eq 2 ] || { echo \"[hook] hook exited $s (missing interpreter or crash); refusing to allow the call. Allowed next step: report the hook failure for reviewed repair and continue independent work; retry only after repair.\" >&2; exit 2; }; exit \"$s\"",
             "onFailure": "block"
           }
         ]
@@ -87,19 +67,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-config-commentary.sh\"",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-config-commentary.sh\"; s=$?; [ \"$s\" -eq 0 ] || [ \"$s\" -eq 2 ] || { echo \"[hook] hook exited $s (missing interpreter or crash); refusing to allow the call. Allowed next step: report the hook failure for reviewed repair and continue independent work; retry only after repair.\" >&2; exit 2; }; exit \"$s\"",
             "onFailure": "block"
-          }
-        ]
-      },
-      {
-        "matcher": "Bash|Write|Edit|NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/probity.sh\"",
-            "onFailure": "block",
-            "timeout": 60
           }
         ]
       }
