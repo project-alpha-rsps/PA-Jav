@@ -16,6 +16,7 @@ hook, the payload and what came back.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import runpy
@@ -1890,50 +1891,135 @@ def test_require_validation_before_git(policy: Policy) -> None:
 
 
 def _validation_candidates(policy: Policy, hint: str) -> list[str]:
-    """Prefer commands inside Markdown backticks over prose that names them."""
+    """Order: backticked commands, then short word n-grams, then the whole hint.
+
+    A prose hint (no backticks) must not be chosen whole while a bare command is
+    available, so n-grams holding a quote come after every quote-free one's turn
+    and the whole hint comes last.
+    """
     words = [
         token.strip("`,.;:()")
         for token in hint.replace("`", " ` ").split()
         if token.strip("`,.;:()")
     ]
-    fragments = hint.split("`")[1::2] + [hint]
-    for size in (4, 3, 2, 1):
+    fragments = hint.split("`")[1::2]
+    for size in (1, 2, 3, 4):
         fragments.extend(
             " ".join(words[start : start + size]) for start in range(0, max(len(words) - size + 1, 0))
         )
+    fragments = [fragment for fragment in fragments if "'" not in fragment and '"' not in fragment]
+    fragments.append(hint)
     return [fragment for fragment in fragments if fragment]
+
+
+def test_prose_validation_hint() -> None:
+    """A prose hint with an apostrophe and no backticks still yields a bare command."""
+    global TESTS
+    prose = "Run a validator first: pytest, yamllint, or the agent's validate.py."
+    with tempfile.TemporaryDirectory() as raw:
+        hooks = Path(raw) / "hooks"
+        shutil.copytree(HOOKS, hooks)
+        data = json.loads((hooks / "policy.json").read_text(encoding="utf-8"))
+        data["validation"] = {"commandPattern": "pytest|yamllint", "hint": prose}
+        (hooks / "policy.json").write_text(json.dumps(data), encoding="utf-8")
+        scratch = load(hooks)
+        assert scratch.validation_pattern is not None
+        chosen = next(
+            (c for c in _validation_candidates(scratch, prose) if scratch.validation_pattern.search(c)),
+            None,
+        )
+        assert chosen in ("pytest", "yamllint"), f"prose hint chose {chosen!r}, not a bare command"
+        # Both tests judge the hook in `hooks_dir`, so point that default at the scratch copy.
+        original = run_hook.__kwdefaults__["hooks_dir"]
+        run_hook.__kwdefaults__["hooks_dir"] = hooks
+        try:
+            test_require_validation_before_git(scratch)
+            test_bridge_transcript_through_the_commit_gate(scratch)
+        finally:
+            run_hook.__kwdefaults__["hooks_dir"] = original
+    TESTS += 1
 
 
 def _git(directory: Path, *arguments: str, check: bool = True) -> None:
     subprocess.run(["git", *arguments], cwd=directory, check=check, capture_output=True)
 
 
+# Every template hook, under the matcher the template registers it with.
+TEMPLATE_HOOK_MATCHERS = {
+    "pre-bash.sh": "Bash",
+    "block-config-commentary.sh": "Write|Edit|NotebookEdit",
+}
+# Generic files directly under .claude/hooks/ (lib/ lives below it). An adopter's own hook
+# may not reuse one of these names.
+TEMPLATE_GENERIC_FILES = frozenset(
+    {"block-config-commentary.sh", "pre-bash.sh", "pre-bash.py", "policy.json"}
+)
+HOOK_PATH_PREFIX = "${CLAUDE_PROJECT_DIR}/.claude/hooks/"
+
+
+def _fail_closed_suffix() -> str:
+    return runpy.run_path(str(ROOT / "scripts" / "check-agent-policy.py"))["FAIL_CLOSED_SUFFIX"]
+
+
+def hook_registration_problems(settings: dict) -> list[str]:
+    """Every way `settings` breaks the hook registration contract; empty when it holds.
+
+    The template hooks are registered once each, under their matcher, fail-closed, with
+    pre-bash.sh first under Bash. An adopter's own hooks are accepted after them when each is a
+    script directly under .claude/hooks/ that is not a template generic file, in the same
+    quoted-path-plus-suffix form, with "onFailure": "block" on PreToolUse.
+    """
+    suffix = _fail_closed_suffix()
+    problems: list[str] = []
+    seen: dict[str, list[str]] = {}
+    first_bash: str | None = None
+    for event, matchers in (settings.get("hooks") or {}).items():
+        for matcher in matchers:
+            for index, entry in enumerate(matcher.get("hooks", [])):
+                command = entry.get("command")
+                if not isinstance(command, str):
+                    continue
+                parts = command.split('"')
+                if len(parts) < 3 or not parts[1].startswith(HOOK_PATH_PREFIX):
+                    problems.append(f"{command!r} is not a quoted script path under {HOOK_PATH_PREFIX}")
+                    continue
+                path = parts[1]
+                name = path[len(HOOK_PATH_PREFIX) :]
+                if event == "PreToolUse" and matcher.get("matcher") == "Bash" and index == 0 and first_bash is None:
+                    first_bash = name
+                seen.setdefault(name, []).append(matcher.get("matcher", ""))
+                if command != f'"{path}"{suffix}':
+                    problems.append(f"{name} is registered without the exact fail-closed command suffix")
+                if event == "PreToolUse" and entry.get("onFailure") != "block":
+                    problems.append(f'{name} is registered without "onFailure": "block"')
+                if name in TEMPLATE_HOOK_MATCHERS:
+                    continue
+                if "/" in name or not name.endswith(".sh"):
+                    problems.append(f"{name} is not a .sh script directly under .claude/hooks/")
+                if name in TEMPLATE_GENERIC_FILES:
+                    problems.append(f"{name} is named like a template generic file")
+    for name, expected in TEMPLATE_HOOK_MATCHERS.items():
+        if name not in seen:
+            problems.append(f"does not register {name}")
+        elif seen[name] != [expected]:
+            problems.append(f"{name} must be registered exactly once under {expected!r}, got {seen[name]}")
+    bash_matchers = [
+        matcher
+        for matcher in (settings.get("hooks") or {}).get("PreToolUse", [])
+        if matcher.get("matcher") == "Bash"
+    ]
+    if bash_matchers:
+        head = bash_matchers[0].get("hooks", [{}])[0].get("command", "")
+        if not head.startswith(f'"{HOOK_PATH_PREFIX}pre-bash.sh"'):
+            problems.append("pre-bash.sh must be the first entry under the Bash matcher")
+    return problems
+
+
 def test_settings_registers_every_hook() -> None:
     global TESTS
     settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    registered = {
-        Path(entry["command"].split('"')[1]).name
-        for event in settings.get("hooks", {}).values()
-        for matcher in event
-        for entry in matcher.get("hooks", [])
-        if isinstance(entry.get("command"), str)
-    }
-    required = {
-        "block-config-commentary.sh",
-        "pre-bash.sh",
-    }
-    missing = required - registered
-    assert not missing, f".claude/settings.json does not register: {sorted(missing)}"
-    # Claude Code lets the tool call through when a hook crashes or times out,
-    # unless the entry says otherwise.
-    for matcher in settings["hooks"]["PreToolUse"]:
-        for entry in matcher["hooks"]:
-            name = Path(entry["command"].split('"')[1]).name
-            if name not in required:
-                continue
-            assert entry.get("onFailure") == "block", (
-                f'{name} is registered without "onFailure": "block"'
-            )
+    problems = hook_registration_problems(settings)
+    assert not problems, f".claude/settings.json hook registration: {problems}"
     # No gate may wait for a person: an `ask` rule stalls an unattended run.
     assert "ask" not in settings.get("permissions", {}), (
         "permissions.ask stalls an unattended agent run; every gate must allow or deny on "
@@ -2295,16 +2381,16 @@ def test_pre_bash_entrypoint_runs_every_rule_and_fails_closed() -> None:
         TESTS += 1
 
     settings = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
-    pre_tool_use = settings["hooks"]["PreToolUse"]
     bash_entries = [
         entry["command"]
-        for matcher in pre_tool_use
+        for matcher in settings["hooks"]["PreToolUse"]
         if matcher["matcher"] == "Bash"
         for entry in matcher["hooks"]
     ]
-    assert len(bash_entries) == 1 and bash_entries[0].split('"')[1].endswith("/pre-bash.sh"), (
-        f"Bash must register exactly pre-bash.sh, got {bash_entries}"
+    assert bash_entries and bash_entries[0].split('"')[1].endswith("/pre-bash.sh"), (
+        f"pre-bash.sh must be the first Bash entry, got {bash_entries}"
     )
+    assert sum(command.split('"')[1].endswith("/pre-bash.sh") for command in bash_entries) == 1, bash_entries
     TESTS += 1
 
 
@@ -2318,7 +2404,9 @@ def test_tokenizer_bypass_forms() -> None:
     """Each form that hides a command from the tokenizer is denied where the plain form is."""
     force_push = "[block-git-unsafe] force-pushing"
     admin_merge = "branch protection rules"
-    kubectl = "[block-runtime] kubectl is blocked"
+    # With `kubectl` on PATH the hook reports the PATH resolution; without it, the policy
+    # message. Both are block-runtime denies; test_kubectl_path_branches pins each.
+    kubectl = "[block-runtime]"
     forms = (
         # Denied before and still denied.
         ("git \\\npush --force origin main", force_push),
@@ -2345,7 +2433,10 @@ def test_tokenizer_bypass_forms() -> None:
         ("git -calias.x='push --force' x origin main", force_push),
     )
     for command, message in forms:
-        run_hook("pre-bash.sh", bash(command), 2, message)
+        if message == kubectl:
+            run_hook("pre-bash.sh", bash(command), 2, message, "kubectl")
+        else:
+            run_hook("pre-bash.sh", bash(command), 2, message)
     # The same forms around an allowed command stay allowed.
     for command in (
         "git \\\nstatus",
@@ -2361,6 +2452,34 @@ def test_tokenizer_bypass_forms() -> None:
         "git -c alias.st='status -s' st",
     ):
         run_hook("pre-bash.sh", bash(command), 0, silent=True)
+
+
+def test_kubectl_path_branches() -> None:
+    """Pin both kubectl denials: found on PATH, and absent from PATH."""
+    forms = ("kubectl get pods", "setsid kubectl get pods", "bash <<'E'\nkubectl get pods\nE")
+    with tempfile.TemporaryDirectory() as raw:
+        stub_dir = Path(raw) / "stub"
+        stub_dir.mkdir()
+        stub = stub_dir / "kubectl"
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+        with_stub = os.pathsep.join([str(stub_dir), os.environ.get("PATH", "")])
+        for command in forms:
+            run_hook(
+                "pre-bash.sh", bash(command), 2,
+                "[block-runtime]", "resolves to blocked cluster CLI `kubectl`",
+                env={"PATH": with_stub},
+            )
+        clean = os.pathsep.join(
+            entry for entry in os.environ.get("PATH", "").split(os.pathsep)
+            if entry and not (Path(entry) / "kubectl").exists()
+        )
+        for command in forms:
+            run_hook(
+                "pre-bash.sh", bash(command), 2,
+                "[block-runtime] kubectl is blocked",
+                env={"PATH": clean},
+            )
 
 
 def test_ordinary_command_corpus() -> None:
@@ -2422,9 +2541,10 @@ def test_hook_command_suffix_contract() -> None:
     assert problems(f'"{path}"{suffix}') == []
     assert any("fail-closed command suffix" in problem for problem in problems(f'"{path}"')), problems(f'"{path}"')
     assert any("unexpected suffix" in problem for problem in problems(f'"{path}"; true')), problems(f'"{path}"; true')
-    # Both registered commands are the script path plus that one constant.
+    # Every registered command is the script path plus that one constant; the template
+    # hooks are always among them, and an adopter's own hooks follow the same form.
     registered = _registered_commands()
-    assert set(registered) == {"pre-bash.sh", "block-config-commentary.sh"}, registered
+    assert set(TEMPLATE_HOOK_MATCHERS) <= set(registered), registered
     for name, command in registered.items():
         assert command == f'"${{CLAUDE_PROJECT_DIR}}/.claude/hooks/{name}"{suffix}', (name, command)
     TESTS += 1
@@ -2451,7 +2571,8 @@ def test_registered_hook_command() -> None:
             env=env,
         )
 
-    registered = _registered_commands()
+    registered = {name: command for name, command in _registered_commands().items() if name in payloads}
+    assert set(registered) == set(payloads), registered
     with tempfile.TemporaryDirectory() as raw:
         scratch = Path(raw)
         empty = scratch / "no-such-dir"
@@ -2479,6 +2600,56 @@ def test_registered_hook_command() -> None:
                 entry.chmod(mode)
                 broken = run(project, command, payloads[name])
                 assert broken.returncode == 2 and "refusing to allow the call" in broken.stderr, (name, label, broken)
+    TESTS += 1
+
+
+def test_hook_registration_accepts_adopter_hooks_and_keeps_template_ones() -> None:
+    """An adopter's own fail-closed hook passes; every weakening of the template's fails."""
+    global TESTS
+    base = json.loads((ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
+    suffix = _fail_closed_suffix()
+
+    def extra(name: str = "local-hook.sh", **overrides: object) -> dict:
+        entry: dict = {"type": "command", "command": f'"{HOOK_PATH_PREFIX}{name}"{suffix}', "onFailure": "block"}
+        entry.update(overrides)
+        return entry
+
+    def with_extra(entry: dict) -> dict:
+        settings = copy.deepcopy(base)
+        bash = next(m for m in settings["hooks"]["PreToolUse"] if m["matcher"] == "Bash")
+        bash["hooks"].append(entry)
+        return settings
+
+    def rejected(settings: dict, fragment: str) -> None:
+        problems = hook_registration_problems(settings)
+        assert any(fragment in problem for problem in problems), (fragment, problems)
+
+    assert hook_registration_problems(with_extra(extra())) == []
+    wrong = extra()
+    wrong["command"] = f'"{HOOK_PATH_PREFIX}local-hook.sh"'
+    rejected(with_extra(wrong), "fail-closed command suffix")
+    missing = extra()
+    del missing["onFailure"]
+    rejected(with_extra(missing), '"onFailure": "block"')
+    rejected(with_extra(extra("pre-bash.py")), "template generic file")
+    rejected(with_extra(extra("policy.json")), "template generic file")
+    rejected(with_extra(extra("lib/rule.sh")), "directly under .claude/hooks/")
+    rejected(with_extra(extra("local-hook.py")), "directly under .claude/hooks/")
+    rejected(with_extra(extra("block-config-commentary.sh")), "exactly once")
+    rejected(with_extra({"type": "command", "command": "./somewhere/else.sh"}), "quoted script path")
+    # An unquoted command is a failure message, never an IndexError.
+    rejected(with_extra({"type": "command", "command": "echo hi", "onFailure": "block"}), "quoted script path")
+    # A template hook that is missing or moved fails.
+    settings = copy.deepcopy(base)
+    settings["hooks"]["PreToolUse"] = [m for m in settings["hooks"]["PreToolUse"] if m["matcher"] != "Bash"]
+    rejected(settings, "does not register pre-bash.sh")
+    settings = copy.deepcopy(base)
+    settings["hooks"]["PreToolUse"][1]["matcher"] = "Edit"
+    rejected(settings, "exactly once")
+    settings = with_extra(extra())
+    bash = next(m for m in settings["hooks"]["PreToolUse"] if m["matcher"] == "Bash")
+    bash["hooks"].reverse()
+    rejected(settings, "first entry under the Bash matcher")
     TESTS += 1
 
 
@@ -2513,9 +2684,12 @@ def main() -> int:
     test_settings_registers_every_hook()
     test_pre_bash_entrypoint_runs_every_rule_and_fails_closed()
     test_tokenizer_bypass_forms()
+    test_kubectl_path_branches()
+    test_prose_validation_hint()
     test_ordinary_command_corpus()
     test_hook_command_suffix_contract()
     test_registered_hook_command()
+    test_hook_registration_accepts_adopter_hooks_and_keeps_template_ones()
 
     for note in SKIPPED:
         print(f"SKIP  {note}")
