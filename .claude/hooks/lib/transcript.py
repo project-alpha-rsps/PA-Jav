@@ -3,7 +3,7 @@
 Claude Code passes `transcript_path` in every hook payload: a JSONL file whose
 `assistant` entries carry `message.content[]` blocks, and whose `tool_use`
 blocks record the tool name and its input in the order the session ran them.
-`require-validation-before-git.sh` needs that ordering to answer "was the
+`validation_rule.py` needs that ordering to answer "was the
 repository validated after the last write" and "was origin fetched since the
 last push".
 
@@ -31,6 +31,9 @@ class TranscriptError(Exception):
 class ToolUse(NamedTuple):
     name: str
     input: dict
+    id: str | None = None
+    is_error: bool | None = None
+    background_or_interrupted: bool = False
 
 
 def read_entries(transcript_path: str | None) -> list[dict]:
@@ -102,6 +105,8 @@ def last_prompt(transcript_path: str | None) -> str:
 def read_tool_uses(transcript_path: str | None) -> list[ToolUse]:
     """Every tool call in the transcript, oldest first."""
     uses: list[ToolUse] = []
+    results: dict[str, bool | None] = {}
+    unfinished: set[str] = set()
     for entry in read_entries(transcript_path):
         message = entry.get("message")
         if not isinstance(message, dict):
@@ -110,13 +115,32 @@ def read_tool_uses(transcript_path: str | None) -> list[ToolUse]:
         if not isinstance(content, list):
             continue
         for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_result":
+                result_id = block.get("tool_use_id")
+                if isinstance(result_id, str):
+                    error = block.get("is_error")
+                    # Duplicate result entries must not erase a failure or an
+                    # asynchronous/interrupted result's unknown exit status.
+                    if results.get(result_id) is not True:
+                        results[result_id] = error if type(error) is bool else None
+                    for metadata in (entry.get("toolUseResult"), block.get("toolUseResult")):
+                        if isinstance(metadata, dict) and (
+                            "backgroundTaskId" in metadata or metadata.get("interrupted") is True
+                        ):
+                            unfinished.add(result_id)
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
             name = block.get("name")
             tool_input = block.get("input")
             if isinstance(name, str) and isinstance(tool_input, dict):
-                uses.append(ToolUse(name, tool_input))
-    return uses
+                use_id = block.get("id")
+                uses.append(ToolUse(name, tool_input, use_id if isinstance(use_id, str) else None))
+    return [use._replace(
+        is_error=results.get(use.id),
+        background_or_interrupted=(
+            use.input.get("run_in_background") is True or use.id in unfinished
+        ),
+    ) for use in uses]
 
 
 def last_index(uses: list[ToolUse], predicate: Callable[[ToolUse], bool], start: int = 0) -> int:

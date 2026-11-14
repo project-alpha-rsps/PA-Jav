@@ -12,7 +12,7 @@ every caller turns that into exit 2.
 Shape, with the defaults applied when a key is absent:
 
     {
-      "repository": "",                 # one line, used by the Probity judge
+      "repository": "",                 # one line naming what the repository holds
       "blockedCommands": {},            # executable -> why it is blocked
       "taskIdentifiers": {
         "prefixes": ["SHOC", "PRO", "MUL"],
@@ -28,6 +28,12 @@ Shape, with the defaults applied when a key is absent:
       "validation": {
         "commandPattern": "",           # regex; empty disables the commit gate
         "hint": ""                      # what to run, named in the denial
+      },
+      "branchPolicy": {                    # optional strict shared-ref profile
+        "profile": "project-alpha-v1",
+        "integrationBranch": "dev",
+        "stableBranch": "main",
+        "protectedPaths": [".claude/**", ".github/workflows/**", "scripts/**"]
       }
     }
 
@@ -58,12 +64,94 @@ DEFAULT_COMMENT_SUFFIXES = (
     ".hcl",
 )
 DEFAULT_DIRECTIVES = ("yaml-language-server:", "renovate:")
+BRANCH_PROFILE = "project-alpha-v1"
+BRANCH_POLICY_GUARDS = (
+    ".claude/settings.json",
+    ".claude/hooks/policy.json",
+    ".claude/hooks/block-config-commentary.sh",
+    ".claude/hooks/pre-bash.sh",
+    ".claude/hooks/pre-bash.py",
+    ".claude/hooks/lib/git_unsafe_rule.py",
+    ".claude/hooks/lib/gh_unsafe_rule.py",
+    ".claude/hooks/lib/branch_policy.py",
+    ".claude/hooks/lib/repo_policy.py",
+    ".claude/hooks/lib/git_command.py",
+    ".claude/hooks/lib/shell_command.py",
+    "scripts/check-agent-policy.py",
+    "scripts/check-trusted-branch-policy.py",
+    ".github/workflows/validate.yaml",
+)
 
 _GLOB_SPECIAL = "\\^$.|+()[]{}"
 
 
 class PolicyError(Exception):
     """The repository policy could not be read or was not the expected shape."""
+
+
+def _branch_name(value: Any, field: str, source: Path) -> str:
+    if not isinstance(value, str) or not value or value == "@" or value.startswith("-"):
+        raise PolicyError(f"{source}: branchPolicy.{field} must be a safe Git branch name")
+    if (
+        value.startswith("/")
+        or value.endswith(("/", "."))
+        or "//" in value
+        or ".." in value
+        or "@{" in value
+        or any(char in value for char in " ~^:?*[\\")
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or any(part.startswith(".") or part.endswith(".lock") for part in value.split("/"))
+    ):
+        raise PolicyError(f"{source}: branchPolicy.{field} must be a safe Git branch name")
+    return value
+
+
+def _branch_policy(value: Any, source: Path) -> dict[str, Any] | None:
+    """Validate the opt-in branch profile. Unknown keys fail closed as well."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PolicyError(f"{source}: `branchPolicy` must be an object")
+    allowed = {"profile", "integrationBranch", "stableBranch", "protectedPaths"}
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise PolicyError(f"{source}: branchPolicy has unknown key(s): {', '.join(unknown)}")
+    profile = value.get("profile")
+    if profile != BRANCH_PROFILE:
+        raise PolicyError(
+            f"{source}: unknown branchPolicy.profile {profile!r}; expected {BRANCH_PROFILE!r}"
+        )
+    integration = _branch_name(value.get("integrationBranch"), "integrationBranch", source)
+    stable = _branch_name(value.get("stableBranch"), "stableBranch", source)
+    if integration == stable:
+        raise PolicyError(f"{source}: branchPolicy integrationBranch and stableBranch must differ")
+    paths = value.get("protectedPaths", [])
+    if not isinstance(paths, list) or any(not isinstance(path, str) or not path.strip() for path in paths):
+        raise PolicyError(
+            f"{source}: branchPolicy.protectedPaths must be a list of non-empty path patterns"
+        )
+    if any(path.startswith("/") or ".." in PurePosixPath(path).parts for path in paths):
+        raise PolicyError(f"{source}: branchPolicy.protectedPaths entries must be repository-relative")
+    try:
+        for path in paths:
+            re.compile(_translate(path))
+    except re.error as exc:
+        raise PolicyError(f"{source}: branchPolicy.protectedPaths contains an invalid pattern: {exc}") from exc
+    missing = [
+        target
+        for target in BRANCH_POLICY_GUARDS
+        if not any(branch_policy_matches(pattern, target) for pattern in paths)
+    ]
+    if missing:
+        raise PolicyError(
+            f"{source}: branchPolicy.protectedPaths must protect the policy and guards: {', '.join(missing)}"
+        )
+    return {
+        "profile": profile,
+        "integrationBranch": integration,
+        "stableBranch": stable,
+        "protectedPaths": tuple(paths),
+    }
 
 
 def _translate(pattern: str) -> str:
@@ -107,7 +195,22 @@ def _translate(pattern: str) -> str:
 
 def matches(pattern: str, relative_path: str) -> bool:
     """True when a repository-relative POSIX path falls under `pattern`."""
+    # Preserve the historical generic matcher exactly; branch-policy matching
+    # has its own normalized path handling so opting in cannot change defaults.
     pattern = pattern.strip().lstrip("./").rstrip("/")
+    return _matches_normalized(pattern, relative_path)
+
+
+def branch_policy_matches(pattern: str, relative_path: str) -> bool:
+    """Match protected paths without the legacy generic matcher's dot stripping."""
+    pattern = pattern.strip()
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    pattern = pattern.rstrip("/")
+    return _matches_normalized(pattern, relative_path)
+
+
+def _matches_normalized(pattern: str, relative_path: str) -> bool:
     if not pattern or not relative_path:
         return False
     if re.fullmatch(_translate(pattern), relative_path) is not None:
@@ -133,6 +236,9 @@ class Policy:
         self.source = source
         self.repository: str = _text(data, "repository", "")
         self.blocked_commands: dict[str, str] = _blocked(data.get("blockedCommands"))
+        if "branchPolicy" in data and data["branchPolicy"] is None:
+            raise PolicyError(f"{source}: `branchPolicy` must be omitted or be an object")
+        self.branch_policy = _branch_policy(data.get("branchPolicy"), source)
 
         identifiers = _section(data, "taskIdentifiers")
         self.task_prefixes: tuple[str, ...] = _strings(
@@ -235,13 +341,16 @@ def load(hooks_dir: Path | None = None) -> Policy:
 
     The dispatcher pins policy from the default branch and points the hooks at
     that cache, so the policy read here is the merged one, not the working tree
-    the agent can edit. `MULTICA_POLICY_DIR` names that cache when it is set.
+    the agent can edit. `MULTICA_POLICY_DIR` names that authoritative cache when
+    set; a missing pinned policy is an error and never falls back to the local
+    working-tree policy.
     """
     candidates: list[Path] = []
     pinned = os.environ.get("MULTICA_POLICY_DIR")
     if pinned:
         candidates.append(Path(pinned) / ".claude" / "hooks" / POLICY_FILENAME)
-    candidates.append(policy_path(hooks_dir))
+    else:
+        candidates.append(policy_path(hooks_dir))
 
     for candidate in candidates:
         if not candidate.is_file():

@@ -1,15 +1,18 @@
 """Shared Bash command inspection for repository PreToolUse hooks.
 
-`block-runtime.sh`, `block-git-unsafe.sh` and `require-validation-before-git.sh`
+`runtime_rule.py`, `git_unsafe_rule.py` and `validation_rule.py`
 all have to see through the same wrappers -- `bash -c`, `eval`, `xargs`,
 `find -exec`, `env`, `sudo`, `timeout`, command substitution -- before they can
 judge what a Bash call actually runs. The tokenizer and the unwrapping live here
 so every hook inspects the same set of resolved commands. Heredoc bodies are cut
-out before tokenising -- they are data, not code -- and only an unquoted
+out before tokenising -- they are data, not code unless fed to a shell as its script -- and only an unquoted
 delimiter leaves a body whose expansions are still inspected. Command
 substitutions are masked out for the same reason: each one is its own quoting
 context, so its body is walked separately rather than lexed inline with the
 command that contains it.
+
+This parser does not follow pipes into a shell, script files or other interpreters.
+Inside a script a shell reads from stdin, only a command it identifies is refused; a line it cannot read stays allowed.
 
 `walk()` raises `Denial` when a command cannot be inspected safely; each hook
 catches it and emits its own prefixed deny message.
@@ -52,6 +55,7 @@ SIMPLE_WRAPPERS = {
     "fi",
     "if",
     "nohup",
+    "setsid",
     "then",
     "time",
     "until",
@@ -69,6 +73,10 @@ class Denial(Exception):
     def __init__(self, message: str) -> None:
         super().__init__(message)
         self.message = message
+
+
+class Uninspectable(Denial):
+    """A command the parser cannot read, as opposed to one it identified."""
 
 
 class Word(str):
@@ -92,6 +100,18 @@ def deny(message: str) -> None:
     raise Denial(message)
 
 
+def deny_dynamic_command_option(token: str) -> None:
+    uninspectable(
+        f"cannot safely resolve dynamic `command` option `{token}`. "
+        "Allowed next step: use literal command options so the executable can be "
+        "checked; no route is granted to run a blocked executable."
+    )
+
+
+def uninspectable(message: str) -> None:
+    raise Uninspectable(message)
+
+
 def normalize_newlines(command: str) -> str:
     output = []
     quote = ""
@@ -113,6 +133,88 @@ def normalize_newlines(command: str) -> str:
             output.append(char)
             continue
         output.append(";" if char in "\r\n" and not quote else char)
+    return "".join(output)
+
+
+REDIRECT_OPERATOR = re.compile(r"(?:[0-9]+|&)?(?:>>|>\||>&|<>|>|<)")
+REDIRECT_DUP_TARGET = re.compile(r"[0-9]+-?|-")
+
+
+def strip_leading_redirects(command: str) -> str:
+    """Drop redirections that sit where a command's name belongs.
+
+    `>out git push --force` and `2>&1 kubectl delete ns x` run the command that
+    follows the redirect; left in place, the redirect token is read as the
+    executable. A redirect after the name is left alone, as are `<(`, `>(`,
+    `<<<` and heredocs, which have their own handling.
+    """
+    output = []
+    quote = ""
+    escaped = False
+    at_start = True
+    index = 0
+    length = len(command)
+    while index < length:
+        char = command[index]
+        if escaped:
+            output.append(char)
+            escaped = False
+            index += 1
+            continue
+        if char == "\\" and quote != "'":
+            output.append(char)
+            escaped = True
+            at_start = False
+            index += 1
+            continue
+        if char in ("'", '"') and (not quote or quote == char):
+            quote = "" if quote else char
+            output.append(char)
+            at_start = False
+            index += 1
+            continue
+        if quote:
+            output.append(char)
+            index += 1
+            continue
+        if char in ";&|(){\n`" and not (char == "&" and REDIRECT_OPERATOR.match(command, index)):
+            at_start = True
+            output.append(char)
+            index += 1
+            continue
+        if char in " \t":
+            output.append(char)
+            index += 1
+            continue
+        if at_start:
+            match = REDIRECT_OPERATOR.match(command, index)
+            if match and not command.startswith(("<<", "<(", ">("), match.end() - 1):
+                cursor = match.end()
+                if match.group().endswith(">&"):
+                    dup = REDIRECT_DUP_TARGET.match(command, cursor)
+                    if dup:
+                        index = dup.end()
+                        output.append(" ")
+                        continue
+                while cursor < length and command[cursor] in " \t":
+                    cursor += 1
+                target_quote = ""
+                while cursor < length:
+                    c = command[cursor]
+                    if target_quote:
+                        if c == target_quote:
+                            target_quote = ""
+                    elif c in ("'", '"'):
+                        target_quote = c
+                    elif c in " \t\n;&|()":
+                        break
+                    cursor += 1
+                index = cursor
+                output.append(" ")
+                continue
+        at_start = False
+        output.append(char)
+        index += 1
     return "".join(output)
 
 
@@ -151,7 +253,7 @@ def lex(command: str) -> list[str]:
         lexer.whitespace_split = True
         return list(lexer)
     except ValueError as exc:
-        deny(f"could not parse Bash command safely: {exc}. Allowed next step: correct the shell syntax of a permitted command and submit a plainly inspectable call; do not change interpreters to repeat a blocked effect.")
+        uninspectable(f"could not parse Bash command safely: {exc}. Allowed next step: correct the shell syntax of a permitted command and submit a plainly inspectable call; do not change interpreters to repeat a blocked effect.")
     return []
 
 
@@ -226,6 +328,73 @@ def split_clauses(tokens: list[str]) -> list[list[str]]:
     return clauses
 
 
+def validation_preserves_status(
+    command: str, pattern: re.Pattern, is_commit: Callable[[str], bool] | None = None
+) -> bool:
+    """Additional, conservative evidence check; never broadens the policy regex.
+
+    Keep clause text as written (including quotes and assignments). Redirection
+    ampersands are not list operators. A pending commit ends the inspected
+    prefix: its own result and any later recovery clause are irrelevant.
+    """
+    if not pattern.search(command):
+        return False
+    text = strip_line_continuations(command).strip()
+    masked = mask_literals(text)
+    # Match redirection ampersands first so `2>&1` and `&>log` stay in a clause.
+    operators = list(re.finditer(r"[<>]&|&>>?|&&|\|\||[;&|()\r\n]", masked))
+    clauses = []
+    joins = []
+    start = 0
+    for match in operators:
+        operator = match.group()
+        if operator in (">&", "<&", "&>", "&>>"):
+            continue
+        clauses.append(text[start:match.start()].strip())
+        joins.append(operator)
+        start = match.end()
+    clauses.append(text[start:].strip())
+    if is_commit is not None:
+        commit_at = next((i for i, clause in enumerate(clauses) if is_commit(clause)), -1)
+        if commit_at < 0:
+            return False
+        clauses = clauses[:commit_at + 1]
+        joins = joins[:commit_at]
+    if any(join not in ("&&", ";", "\n", "\r") for join in joins):
+        return False
+    for clause in clauses:
+        try:
+            tokens = tokenize(clause)
+        except Denial:
+            return False
+        if not tokens or scan_substitutions(clause)[1] or "<<" in mask_literals(clause):
+            return False
+        index = 0
+        while index < len(tokens) and ENV_ASSIGN.match(tokens[index]):
+            index += 1
+        if index == len(tokens):
+            return False
+        executable = tokens[index].rsplit("/", 1)[-1]
+        if executable in SIMPLE_WRAPPERS | {"for", "select", "case", "function", "coproc", "eval", "source", "."}:
+            return False
+        try:
+            index = command_index(tokens)
+        except Denial:
+            return False
+        if index < 0:
+            return False
+        executable = tokens[index].rsplit("/", 1)[-1]
+        if executable in {"eval", "source", ".", "find"}:
+            return False
+        if executable in SHELLS and any(
+            token.startswith("-") and "c" in token[1:] for token in tokens[index + 1:]
+        ):
+            return False
+    candidates = clauses[:-1] if is_commit is not None else clauses
+    last = max((i for i, clause in enumerate(candidates) if pattern.search(clause)), default=-1)
+    return last >= 0 and all(join == "&&" for join in joins[last:])
+
+
 def skip_options(tokens: list[str], index: int, value_options: set[str]) -> int:
     while index < len(tokens):
         token = tokens[index]
@@ -240,7 +409,33 @@ def skip_options(tokens: list[str], index: int, value_options: set[str]) -> int:
     return index
 
 
-def command_index(tokens: list[str]) -> int:
+def resolve_command_word(token: str, variables: dict[str, str]) -> str:
+    """Expand whole-word and embedded variable references, refusing cycles."""
+    def resolve_name(name: str, seen: set[str]) -> str:
+        if name not in variables or name in seen:
+            deny_dynamic_command_option(f"${name}")
+        value = variables[name]
+        match = VARIABLE_REF.fullmatch(value)
+        if match:
+            return resolve_name(match.group(1) or match.group(2), seen | {name})
+        return value
+
+    match = VARIABLE_REF.fullmatch(token)
+    if match:
+        return resolve_name(match.group(1) or match.group(2), set())
+
+    def replace(match: re.Match[str]) -> str:
+        return resolve_name(match.group(1) or match.group(2), set())
+
+    return re.sub(
+        r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)",
+        replace,
+        token,
+    )
+
+
+def command_index(tokens: list[str], variables: dict[str, str] | None = None) -> int:
+    variables = variables or {}
     i = 0
     while i < len(tokens):
         token = tokens[i]
@@ -253,7 +448,7 @@ def command_index(tokens: list[str]) -> int:
                 option in {"-S", "--split-string"} or option.startswith("--split-string=")
                 for option in tokens[i + 1 :]
             ):
-                deny("env --split-string cannot be inspected safely. Allowed next step: write a permitted command with literal arguments rather than a split string; do not use another wrapper to repeat a blocked effect.")
+                uninspectable("env --split-string cannot be inspected safely. Allowed next step: write a permitted command with literal arguments rather than a split string; do not use another wrapper to repeat a blocked effect.")
             i = skip_options(tokens, i + 1, {"-C", "--chdir", "-S", "--split-string", "-u", "--unset"})
             while i < len(tokens) and ENV_ASSIGN.match(tokens[i]):
                 i += 1
@@ -277,11 +472,53 @@ def command_index(tokens: list[str]) -> int:
         if name == "nice":
             i = skip_options(tokens, i + 1, {"-n", "--adjustment"})
             continue
+        if name == "stdbuf":
+            i = skip_options(tokens, i + 1, {"-i", "-o", "-e", "--input", "--output", "--error"})
+            continue
+        if name == "busybox":
+            # `busybox sh -c ...` runs the applet named by the next word.
+            i += 1
+            continue
+        if name == "command" and lookup_only(tokens[i + 1 :]):
+            # `command -v NAME` and `command -V NAME` look a name up and print
+            # it; nothing runs, so a loop variable there is not an executable.
+            return -1
         if name in SIMPLE_WRAPPERS:
-            i = skip_options(tokens, i + 1, set())
+            if name == "command":
+                # Resolve variable-backed option words before skipping them;
+                # otherwise `command $o kubectl` treats `$o` as the executable.
+                resolved = list(tokens)
+                cursor = i + 1
+                while cursor < len(tokens):
+                    token = str(tokens[cursor])
+                    if "$" in token:
+                        token = resolve_command_word(token, variables)
+                        if any(char.isspace() for char in token):
+                            deny_dynamic_command_option(token)
+                        if token.startswith("-") and token != "--" and not re.fullmatch(
+                            r"-[pvV]+", token
+                        ):
+                            deny_dynamic_command_option(token)
+                        resolved[cursor] = token
+                    if token == "--" or not token.startswith("-") or token == "-":
+                        break
+                    cursor += 1
+                i = skip_options(resolved, i + 1, set())
+            else:
+                i = skip_options(tokens, i + 1, set())
             continue
         return i
     return -1
+
+
+def lookup_only(arguments: list[str]) -> bool:
+    """True when `command`'s options make it describe NAME instead of running it."""
+    for token in arguments:
+        if not re.fullmatch(r"-[pvV]+", token):
+            return False
+        if "v" in token or "V" in token:
+            return True
+    return False
 
 
 def record_assignments(tokens: list[str], variables: dict[str, str]) -> None:
@@ -305,14 +542,14 @@ def resolve_executable(token: str, variables: dict[str, str], blocked_names: Ite
             break
         name = match.group(1) or match.group(2)
         if name in seen or name not in variables:
-            deny(f"cannot safely resolve dynamic executable `{token}`. Allowed next step: name the permitted executable literally so it can be checked; no route is granted to run a blocked executable.")
+            uninspectable(f"cannot safely resolve dynamic executable `{token}`. Allowed next step: name the permitted executable literally so it can be checked; no route is granted to run a blocked executable.")
         seen.add(name)
         token = variables[name]
         literal = False
     if "$" in token or not token or any(char.isspace() for char in token):
-        deny(f"cannot safely resolve dynamic executable `{token}`. Allowed next step: name the permitted executable literally so it can be checked; no route is granted to run a blocked executable.")
+        uninspectable(f"cannot safely resolve dynamic executable `{token}`. Allowed next step: name the permitted executable literally so it can be checked; no route is granted to run a blocked executable.")
     if not literal and ("{" in token or "}" in token):
-        deny(f"cannot safely resolve brace-expanded executable `{token}`. Allowed next step: name one permitted executable literally, without brace expansion, so it can be checked; no route is granted to run a blocked executable.")
+        uninspectable(f"cannot safely resolve brace-expanded executable `{token}`. Allowed next step: name one permitted executable literally, without brace expansion, so it can be checked; no route is granted to run a blocked executable.")
     executable = token.rsplit("/", 1)[-1]
     if not literal and any(char in executable for char in "*?[") and any(
         fnmatch.fnmatchcase(name, executable) for name in blocked
@@ -367,11 +604,14 @@ def read_heredoc_delimiter(command: str, index: int) -> tuple[str, bool, int]:
 
 
 def read_heredoc_bodies(
-    command: str, index: int, pending: list[tuple[str, bool, bool]]
+    command: str,
+    index: int,
+    pending: list[tuple[str, bool, bool]],
+    all_bodies: list[str] | None = None,
 ) -> tuple[int, list[str], bool]:
     """Consume the bodies of the heredocs opened on the line just ended.
 
-    Returns (next_index, bodies_that_expand, stripped). `stripped` is False
+    Returns (next_index, bodies as (text, expands), stripped). `stripped` is False
     when a terminator line is missing, which means the `<<` did not open a
     heredoc at all (an arithmetic shift, say) — the caller then keeps the raw
     text so it is still inspected.
@@ -392,12 +632,37 @@ def read_heredoc_bodies(
             body.append(line)
         if not terminated:
             return index, bodies, False
+        if all_bodies is not None:
+            all_bodies.append("\n".join(body))
         if expands and body:
             bodies.append("\n".join(body))
     return index, bodies, True
 
 
-def strip_heredocs(command: str) -> tuple[str, list[str]]:
+def feeds_shell(clause: str) -> bool:
+    """True when a heredoc opened at the end of `clause` is a shell's script."""
+    clause = re.sub(r"(?:^|(?<=\s))\d*(?:&>>?|[<>]&|>>?|<)\s*\S*", " ", clause)
+    try:
+        tokens = tokenize(clause)
+        index = command_index(tokens)
+    except Denial:
+        return False
+    if index < 0 or tokens[index].rsplit("/", 1)[-1] not in SHELLS:
+        return False
+    arguments = tokens[index + 1 :]
+    if any(t.startswith("-") and not t.startswith("--") and "c" in t[1:] for t in arguments):
+        return False
+    if any(t.startswith("-") and not t.startswith("--") and "s" in t[1:] for t in arguments):
+        return True
+    return all(
+        t.startswith(("-", "+")) or (arguments[i - 1][-1:] == "o" and arguments[i - 1][:1] in ("-", "+"))
+        for i, t in enumerate(arguments)
+    )
+
+
+def strip_heredocs(
+    command: str, shell_bodies: list[str] | None = None
+) -> tuple[str, list[str]]:
     """Cut heredoc bodies out of the command before it is tokenised.
 
     A heredoc body is data, not code: tokenising it puts every line's first
@@ -415,6 +680,9 @@ def strip_heredocs(command: str) -> tuple[str, list[str]]:
     output = []
     expanding_bodies = []
     pending: list[tuple[str, bool, bool]] = []
+    receivers: list[bool] = []
+    clause_start = 0
+    line_start = 0
     quote = ""
     quote_stack: list[str] = []
     paren_depth_stack: list[int] = []
@@ -447,6 +715,7 @@ def strip_heredocs(command: str) -> tuple[str, list[str]]:
             quote = ""
             output.append("$(")
             index += 2
+            clause_start = len(output)
             continue
         if quote_stack and not quote and char == "(":
             paren_depth_stack[-1] += 1
@@ -463,6 +732,8 @@ def strip_heredocs(command: str) -> tuple[str, list[str]]:
             index += 1
             continue
         if not quote and command.startswith("<<<", index):
+            if shell_bodies is not None and feeds_shell("".join(output[clause_start:])):
+                shell_bodies.append(read_heredoc_delimiter(command, index + 3)[0])
             output.append("<<<")
             index += 3
             continue
@@ -472,13 +743,28 @@ def strip_heredocs(command: str) -> tuple[str, list[str]]:
             delimiter, expands, cursor = read_heredoc_delimiter(command, cursor)
             if delimiter:
                 pending.append((delimiter, strip_tabs, expands))
+                receivers.append(feeds_shell("".join(output[clause_start:])))
                 output.append(" ")
                 index = cursor
                 continue
         if not quote and char == "\n" and pending:
+            # `cat <<E | bash` pipes the body into a shell: a later pipeline
+            # stage on the opening line that reads stdin as its script.
+            piped = any(
+                feeds_shell(stage)
+                for stage in re.split(r"\|&?", "".join(output[line_start:]))[1:]
+            )
             output.append("\n")
-            cursor, bodies, stripped = read_heredoc_bodies(command, index + 1, pending)
+            every_body: list[str] = []
+            cursor, bodies, stripped = read_heredoc_bodies(command, index + 1, pending, every_body)
+            if shell_bodies is not None:
+                for body, (_, _, expands), feeds in zip(every_body, pending, receivers):
+                    if feeds or piped:
+                        shell_bodies.append(re.sub(r"\\([$`\\])", r"\1", body) if expands else body)
             pending = []
+            receivers = []
+            clause_start = len(output)
+            line_start = len(output)
             if not stripped:
                 output.append(command[index + 1 :])
                 break
@@ -487,6 +773,12 @@ def strip_heredocs(command: str) -> tuple[str, list[str]]:
             continue
         output.append(char)
         index += 1
+        if char == "\n":
+            line_start = len(output)
+        if not quote and char in ";&|(\n" and not (
+            char == "&" and index >= 2 and command[index - 2] in "<>"
+        ) and not (char == "&" and command[index : index + 1] == ">"):
+            clause_start = len(output)
     return "".join(output), expanding_bodies
 
 
@@ -518,7 +810,11 @@ def read_substitution(command: str, start: int) -> tuple[str, int]:
     return command[start + 1 :], length
 
 
-def scan_substitutions(command: str) -> tuple[str, list[str]]:
+def scan_substitutions(
+    command: str,
+    arithmetic_assignments: dict[str, list[str]] | None = None,
+    arithmetic_seen: set[str] | None = None,
+) -> tuple[str, list[str]]:
     """Replace each `$(...)` and backtick span with an inert placeholder, and
     return the bodies the shell would expand alongside it.
 
@@ -535,6 +831,9 @@ def scan_substitutions(command: str) -> tuple[str, list[str]]:
     a substitution in command position is still refused, while the body itself
     is walked separately with its quoting intact.
     """
+    arithmetic_assignments = arithmetic_assignments or {}
+    if arithmetic_seen is None:
+        arithmetic_seen = set()
     output = []
     found = []
     quote = ""
@@ -563,6 +862,26 @@ def scan_substitutions(command: str) -> tuple[str, list[str]]:
             continue
         if quote != "'" and command.startswith("$(", index):
             nested, index = read_substitution(command, index + 1)
+            arithmetic = arithmetic_body(nested)
+            if arithmetic is not None:
+                # `$(( … ))` evaluates an expression; only the command
+                # substitutions inside it run anything. Arithmetic variables
+                # can hold array subscripts whose text is expanded as shell
+                # syntax, so inspect the recorded assignment value too.
+                found.extend(find_substitutions(arithmetic))
+                found.extend(
+                    arithmetic_variable_substitutions(
+                        arithmetic, arithmetic_assignments, arithmetic_seen
+                    )
+                )
+            elif nested.strip():
+                found.append(nested)
+            output.append(SUBSTITUTION_PLACEHOLDER)
+            continue
+        if not quote and char in "<>" and command.startswith("(", index + 1):
+            # `<( … )` and `>( … )` run their body as a command and stand in
+            # for a file name, so they are walked and then read as an argument.
+            nested, index = read_substitution(command, index + 1)
             if nested.strip():
                 found.append(nested)
             output.append(SUBSTITUTION_PLACEHOLDER)
@@ -583,9 +902,100 @@ def scan_substitutions(command: str) -> tuple[str, list[str]]:
     return "".join(output), found
 
 
+def arithmetic_body(nested: str) -> str | None:
+    """The expression of `$(( … ))`, given the text between `$(` and `)`.
+
+    That text is `( … )` with one paren pair spanning all of it. `$( (a); (b) )`
+    starts with a paren too, but its first pair closes early, so it stays a
+    command substitution.
+    """
+    if not (nested.startswith("(") and nested.endswith(")")):
+        return None
+    inner, end = read_substitution(nested, 0)
+    if end != len(nested):
+        return None
+    return inner
+
+
+def arithmetic_variable_substitutions(
+    expression: str,
+    assignments: dict[str, list[str]],
+    seen: set[str] | None = None,
+) -> list[str]:
+    """Inspect each assigned value reached from an arithmetic variable once."""
+    if seen is None:
+        seen = set()
+    found = []
+    pending = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression)
+    while pending:
+        name = pending.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for value in assignments.get(name, []):
+            # A backslash preserved by a double-quoted assignment can be
+            # activated by arithmetic expansion.
+            arithmetic_value = value.replace(r"\$(", "$(").replace(r"\`", "`").replace("'", "")
+            _, nested = scan_substitutions(
+                arithmetic_value,
+                arithmetic_assignments=assignments,
+                arithmetic_seen=seen,
+            )
+            found.extend(nested)
+            pending.extend(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", arithmetic_value))
+    return found
+
+
+def record_assignment_values(
+    tokens: list[str], assignments: dict[str, list[str]]
+) -> None:
+    for token in tokens:
+        if not ENV_ASSIGN.match(token):
+            continue
+        name, value = token.split("=", 1)
+        values = assignments.setdefault(name, [])
+        if value not in values:
+            values.append(value)
+
+
 def find_substitutions(command: str) -> list[str]:
     """The `$(...)` and backtick bodies the shell would expand."""
     return scan_substitutions(command)[1]
+
+
+CASE_PATTERN = re.compile(r"^\s*\(?[^\s()$`'\"=]+(?:\s*\|\s*[^\s()$`'\"=]+)*\)")
+
+
+def walk_script(script, visit, blocked_names, variables, assignments, seen) -> None:
+    """Walk text read from shell stdin, preserving nested heredocs as data."""
+    nested_scripts: list[str] = []
+    text, expanding = strip_heredocs(script, nested_scripts)
+    for body in expanding:
+        for nested in scan_substitutions(body, assignments, seen)[1]:
+            walk(nested, visit, blocked_names, variables.copy(), assignments, seen)
+    kept = "\n".join(
+        line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")
+    )
+    lines = []
+    depth = 0
+    for line in strip_line_continuations(kept).splitlines():
+        masked = mask_literals(line)
+        depth += len(re.findall(r"(?:^|[\s;])case\s", masked))
+        if depth:
+            line = CASE_PATTERN.sub("", line)
+        depth -= len(re.findall(r"(?:^|[\s;])esac(?:$|[\s;])", masked))
+        depth = max(depth, 0)
+        lines.append(line)
+    try:
+        walk("\n".join(lines), visit, blocked_names, variables, assignments, seen)
+    except Uninspectable:
+        for line in lines:
+            try:
+                walk(line, visit, blocked_names, variables, assignments, seen)
+            except Uninspectable:
+                continue
+    for nested in nested_scripts:
+        walk_script(nested, visit, blocked_names, variables, assignments, seen)
 
 
 def walk(
@@ -593,6 +1003,8 @@ def walk(
     visit: Callable[[str, list[str]], None],
     blocked_names: Iterable[str] = (),
     variables: dict[str, str] | None = None,
+    arithmetic_assignments: dict[str, list[str]] | None = None,
+    arithmetic_seen: set[str] | None = None,
 ) -> None:
     """Resolve every simple command in `command` and hand it to `visit`.
 
@@ -602,17 +1014,44 @@ def walk(
     """
     if variables is None:
         variables = {}
-    command, expanding_bodies = strip_heredocs(command)
+    if arithmetic_assignments is None:
+        arithmetic_assignments = {}
+    if arithmetic_seen is None:
+        arithmetic_seen = set()
+    shell_bodies: list[str] = []
+    command, expanding_bodies = strip_heredocs(command, shell_bodies)
+    # This record is intentionally separate from `variables`: it contains all
+    # assignment values for arithmetic inspection, not a simulated shell state.
+    masked_command, _ = scan_substitutions(command)
+    for clause in split_clauses(tokenize(masked_command)):
+        record_assignment_values(clause, arithmetic_assignments)
+
     for body in expanding_bodies:
-        for nested_command in find_substitutions(body):
-            walk(nested_command, visit, blocked_names, variables.copy())
-    command, nested_commands = scan_substitutions(command)
+        _, nested_commands = scan_substitutions(body, arithmetic_assignments, arithmetic_seen)
+        for nested_command in nested_commands:
+            walk(
+                nested_command,
+                visit,
+                blocked_names,
+                variables.copy(),
+                arithmetic_assignments,
+                arithmetic_seen,
+            )
+    command, nested_commands = scan_substitutions(command, arithmetic_assignments, arithmetic_seen)
     for nested_command in nested_commands:
-        walk(nested_command, visit, blocked_names, variables.copy())
+        walk(
+            nested_command,
+            visit,
+            blocked_names,
+            variables.copy(),
+            arithmetic_assignments,
+            arithmetic_seen,
+        )
+    command = strip_leading_redirects(command)
 
     for clause in split_clauses(tokenize(command)):
         record_assignments(clause, variables)
-        index = command_index(clause)
+        index = command_index(clause, variables)
         if index < 0:
             continue
         executable = resolve_executable(clause[index], variables, blocked_names)
@@ -627,11 +1066,51 @@ def walk(
                     and "c" in option[1:]
                 ):
                     if option_index + 1 >= len(remaining):
-                        deny(f"cannot inspect `{executable}` command string. Allowed next step: submit a plainly inspectable permitted command with literal arguments; do not use another shell or interpreter to repeat a blocked effect.")
-                    walk(remaining[option_index + 1], visit, blocked_names, variables.copy())
+                        uninspectable(f"cannot inspect `{executable}` command string. Allowed next step: submit a plainly inspectable permitted command with literal arguments; do not use another shell or interpreter to repeat a blocked effect.")
+                    walk(
+                        remaining[option_index + 1],
+                        visit,
+                        blocked_names,
+                        variables.copy(),
+                        arithmetic_assignments,
+                        arithmetic_seen,
+                    )
+                    break
+        elif executable == "script":
+            for option_index, option in enumerate(remaining):
+                if option.startswith("--command="):
+                    walk(
+                        option.split("=", 1)[1],
+                        visit,
+                        blocked_names,
+                        variables.copy(),
+                        arithmetic_assignments,
+                        arithmetic_seen,
+                    )
+                    break
+                if option == "--command" or (
+                    option.startswith("-") and not option.startswith("--") and "c" in option[1:]
+                ):
+                    if option_index + 1 >= len(remaining):
+                        uninspectable("cannot inspect `script` command string. Allowed next step: submit a plainly inspectable permitted command with literal arguments; do not use another shell or interpreter to repeat a blocked effect.")
+                    walk(
+                        remaining[option_index + 1],
+                        visit,
+                        blocked_names,
+                        variables.copy(),
+                        arithmetic_assignments,
+                        arithmetic_seen,
+                    )
                     break
         elif executable == "eval" and remaining:
-            walk(" ".join(remaining), visit, blocked_names, variables.copy())
+            walk(
+                " ".join(remaining),
+                visit,
+                blocked_names,
+                variables.copy(),
+                arithmetic_assignments,
+                arithmetic_seen,
+            )
         elif executable == "xargs":
             command_start = skip_options(
                 remaining,
@@ -640,9 +1119,12 @@ def walk(
             )
             if command_start < len(remaining):
                 nested = " ".join(shlex.quote(token) for token in remaining[command_start:])
-                walk(nested, visit, blocked_names, variables.copy())
+                walk(nested, visit, blocked_names, variables.copy(), arithmetic_assignments, arithmetic_seen)
         elif executable == "find":
             for option_index, option in enumerate(remaining):
                 if option in ("-exec", "-execdir") and option_index + 1 < len(remaining):
                     nested = " ".join(shlex.quote(token) for token in remaining[option_index + 1 :])
-                    walk(nested, visit, blocked_names, variables.copy())
+                    walk(nested, visit, blocked_names, variables.copy(), arithmetic_assignments, arithmetic_seen)
+
+    for body in shell_bodies:
+        walk_script(body, visit, blocked_names, variables.copy(), arithmetic_assignments, arithmetic_seen)
