@@ -33,7 +33,7 @@ from pathlib import Path
 sys.path.insert(0, os.environ["HOOK_LIB_DIR"])
 
 from config_commentary import in_scope, violations  # noqa: E402
-from repo_policy import PolicyError, load  # noqa: E402
+from repo_policy import PolicyError, branch_policy_matches, load  # noqa: E402
 
 
 def path_indexed(directory: Path, relative: str) -> bool:
@@ -91,12 +91,21 @@ try:
     relative = path.relative_to(project_root).as_posix()
 except ValueError:
     sys.exit(0)
+if policy.branch_policy and any(
+    branch_policy_matches(pattern, relative) for pattern in policy.branch_policy["protectedPaths"]
+):
+    deny(
+        f"branchPolicy protects {relative}; an ordinary change cannot authorize its own policy or guard removal. "
+        "Allowed next step: use the repository's independently authorized maintenance route with base-policy "
+        "and exact-head review evidence; if none exists, report the path and owner action because no agent route exists."
+    )
 indexed = path_indexed(project_root, relative)
 if not in_scope(relative, policy, indexed=indexed):
     sys.exit(0)
 
 try:
-    existing = path.read_text(encoding="utf-8")
+    with path.open("r", encoding="utf-8", newline="") as source:
+        existing = source.read()
 except FileNotFoundError:
     existing = ""
 except (OSError, UnicodeError) as exc:
