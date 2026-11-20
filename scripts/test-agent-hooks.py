@@ -2858,6 +2858,121 @@ def test_hook_registration_accepts_adopter_hooks_and_keeps_template_ones() -> No
     TESTS += 1
 
 
+def test_runtime_cli_path(policy: Policy) -> None:
+    """Only the untainted runtime `multica` path resolves; nothing here executes it."""
+    refusal = "cannot safely resolve dynamic executable"
+    blocked = sorted(policy.blocked_commands)
+    with tempfile.TemporaryDirectory(prefix=".agent-cli-") as directory:
+        root = Path(directory)
+        cli = root / "multica"
+        marker = root / "executed"
+        cli.write_text(f"#!/bin/sh\ntouch {marker}\nexit 97\n", encoding="utf-8")
+        cli.chmod(0o755)
+        trusted = {"MULTICA_CLI_PATH": str(cli), "OTHER_VAR": str(cli)}
+        hook = "block-runtime.sh"
+        for command in (
+            '"$MULTICA_CLI_PATH" issue comment add X --content-file ./r.md --output table && "$MULTICA_CLI_PATH" issue status X done',
+            '"$MULTICA_CLI_PATH" issue get x',
+            '"${MULTICA_CLI_PATH}" issue get x',
+            "$MULTICA_CLI_PATH --version",
+            "${MULTICA_CLI_PATH} --version",
+            'bash -c \'"$MULTICA_CLI_PATH" issue get x\'',
+            'printf "%s" "$("$MULTICA_CLI_PATH" issue get x)"',
+        ):
+            run_hook(hook, bash(command), 0, env=trusted)
+        for command in (
+            '"$OTHER_VAR" --version',
+            '"${OTHER_VAR}" --version',
+            '"${MULTICA_CLI_PATH}x" --version',
+            '"$(echo multica)" --version',
+            '`echo multica` --version',
+            '$unknown get pods',
+            'm=$MULTICA_CLI_PATH; "$m" --version',
+        ):
+            run_hook(hook, bash(command), 2, refusal, env=trusted)
+        # No direct, prefix, builtin, wrapper, source or nested mutation may let
+        # this special reference use an in-command or inherited value.
+        for mutation in (
+            "MULTICA_CLI_PATH=/bin/sh",
+            "MULTICA_CLI_PATH+=/bin/sh",
+            "MULTICA_CLI_PATH[0]=/bin/sh",
+            "export MULTICA_CLI_PATH=/bin/sh",
+            "export MULTICA_CLI_PATH",
+            "declare MULTICA_CLI_PATH=/bin/sh",
+            "declare -x MULTICA_CLI_PATH=/bin/sh",
+            "typeset MULTICA_CLI_PATH=/bin/sh",
+            "readonly MULTICA_CLI_PATH=/bin/sh",
+            "unset MULTICA_CLI_PATH",
+            "read MULTICA_CLI_PATH <<< /bin/sh",
+            "printf -v MULTICA_CLI_PATH %s /bin/sh",
+            ". ./f",
+            "source ./f",
+            "source",
+            ".",
+            "sour\\ce ./f",
+            "sou\\\nrce ./f",
+            "MULTICA_CLI\\\n_PATH=/bin/sh",
+            "exp\\\nort MULTICA_CLI_PATH=/bin/sh",
+        ):
+            run_hook(hook, bash(f'{mutation}; "$MULTICA_CLI_PATH" issue get x'), 2, refusal, env=trusted)
+        for command in (
+            'MULTICA_CLI_PATH=/bin/sh "$MULTICA_CLI_PATH" x',
+            'env MULTICA_CLI_PATH=/bin/sh "$MULTICA_CLI_PATH" x',
+            'f() { local MULTICA_CLI_PATH=/bin/sh; "$MULTICA_CLI_PATH" x; }; f',
+            'bash -c \'MULTICA_CLI_PATH=/bin/sh; "$MULTICA_CLI_PATH" x\'',
+            '"${MULTICA_CLI_PATH:=/bin/sh}" x',
+            'source ./f && "$MULTICA_CLI_PATH" x',
+            'source ./f; bash -c \'"$MULTICA_CLI_PATH" x\'',
+            'bash -c \'source ./f; "$MULTICA_CLI_PATH" x\'',
+            'printf "%s" "$(. ./f; "$MULTICA_CLI_PATH" x)"',
+            'MULTICA_CLI_PATH=/bin/sh; printf "%s" "$("$MULTICA_CLI_PATH" x)"',
+            '"$MULTICA_CLI_PATH" x; source ./f',
+            # Stdin scripts: the walk swallows uninspectable lines, so the
+            # refusal has to be a plain denial that still surfaces.
+            'bash <<\'EOF\'\n. ./f\n"$MULTICA_CLI_PATH" x\nEOF',
+            'bash <<\'EOF\'\nMULTICA_CLI_PATH=/bin/sh\n"$MULTICA_CLI_PATH" x\nEOF',
+            'bash <<\'EOF\'\nMULTICA_CLI_PATH=/bin/sh\n"$MULTICA_CLI_PATH" get pods\nEOF',
+            'bash <<\'EOF\'\nexp\\\nort MULTICA_CLI_PATH=/bin/sh\n"$MULTICA_CLI_PATH" x\nEOF',
+        ):
+            run_hook(hook, bash(command), 2, refusal, env=trusted)
+        # An unset value is genuinely absent, not replaced by the runner's own.
+        saved = os.environ.pop("MULTICA_CLI_PATH", None)
+        try:
+            run_hook(hook, bash('"$MULTICA_CLI_PATH" x'), 2, refusal)
+        finally:
+            if saved is not None:
+                os.environ["MULTICA_CLI_PATH"] = saved
+        noexec = root / "noexec" / "multica"
+        noexec.parent.mkdir()
+        noexec.write_text("fixture", encoding="utf-8")
+        noexec.chmod(0o644)
+        cli_directory = root / "directory" / "multica"
+        cli_directory.mkdir(parents=True)
+        other = root / "other"
+        other.write_text("#!/bin/sh\nexit 97\n", encoding="utf-8")
+        other.chmod(0o755)
+        link = root / "linked" / "multica"
+        link.parent.mkdir()
+        link.symlink_to(other)
+        for value in ("", str(root / "missing"), str(cli_directory), str(noexec), str(other), str(link)):
+            run_hook(hook, bash('"$MULTICA_CLI_PATH" x'), 2, refusal, env={"MULTICA_CLI_PATH": value})
+        for name in blocked:
+            target = root / "blocked" / name
+            target.parent.mkdir(exist_ok=True)
+            target.touch()
+            target.chmod(0o755)
+            # A blocked name, and a `multica` symlink to one, must fail closed
+            # rather than trust the symlink's basename.
+            run_hook(hook, bash('"$MULTICA_CLI_PATH" get all'), 2, env={"MULTICA_CLI_PATH": str(target)})
+            blocked_link = root / f"linked-{name}" / "multica"
+            blocked_link.parent.mkdir()
+            blocked_link.symlink_to(target)
+            run_hook(hook, bash('"$MULTICA_CLI_PATH" get all'), 2, env={"MULTICA_CLI_PATH": str(blocked_link)})
+            run_hook(hook, bash(f"{name} get pods"), 2, "blocked", env=trusted)
+            run_hook(hook, bash(f"tool={name}; $tool get all"), 2, env=trusted)
+        assert not marker.exists(), "a synthetic payload was executed"
+
+
 # --------------------------------------------------------------------------
 # Repository-specific cases — add yours below and register them in main()
 # --------------------------------------------------------------------------
@@ -2876,6 +2991,7 @@ def main() -> int:
     test_heredoc_inside_substitution_and_line_continuations()
     test_shell_stdin_scripts(policy)
     test_block_runtime(policy)
+    test_runtime_cli_path(policy)
     test_block_git_unsafe()
     test_branch_policy_full_git_hook_binds_push_and_local_history()
     test_branch_policy_full_git_hook_uses_pinned_policy_authoritatively()
