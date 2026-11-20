@@ -21,6 +21,7 @@ catches it and emits its own prefixed deny message.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import shlex
 import shutil
@@ -62,6 +63,19 @@ SIMPLE_WRAPPERS = {
     "while",
 }
 
+
+# Only the runtime-provided CLI may be read from the environment. A write or
+# source anywhere in the command makes that inherited identity untrustworthy;
+# nested walks carry this sentinel as well as scanning their own command text.
+CLI_PATH_VARIABLE = "MULTICA_CLI_PATH"
+CLI_PATH_BASENAME = "multica"
+CLI_PATH_TAINT = "\x00cli-path-assigned"
+CLI_PATH_WRITE = re.compile(
+    r"(?<![A-Za-z0-9_$])MULTICA_CLI_PATH(?:\[[^\]]*\])?\+?="
+    r"|\b(?:export|declare|typeset|readonly|local|read|unset|env|printf|getopts|mapfile|readarray|for|select|let|eval)\b[^;&|\n]*(?<![A-Za-z0-9_$])MULTICA_CLI_PATH\b"
+    r"|\$\{!?MULTICA_CLI_PATH[^}A-Za-z0-9_]"
+    r"|(?<![A-Za-z0-9_/$])(?:source|\.)(?=$|[\s;&|()])"
+)
 
 LITERAL_SENTINEL = "\x01"
 SUBSTITUTION_PLACEHOLDER = "$__command_substitution__"
@@ -529,6 +543,24 @@ def record_assignments(tokens: list[str], variables: dict[str, str]) -> None:
         variables[name] = value
 
 
+def join_line_continuations(command: str) -> str:
+    """Delete every backslash-newline pair, as Bash does, for the taint scan only."""
+    return command.replace("\\\n", "")
+
+
+def resolve_cli_path(token: str, variables: dict[str, str]) -> str:
+    """Resolve only an untainted runtime CLI to an executable real `multica`."""
+    value = os.environ.get(CLI_PATH_VARIABLE, "")
+    if value and CLI_PATH_TAINT not in variables and CLI_PATH_VARIABLE not in variables:
+        try:
+            real = Path(value).resolve(strict=True)
+            if real.is_file() and os.access(real, os.X_OK) and real.name == CLI_PATH_BASENAME:
+                return str(real)
+        except (OSError, RuntimeError):
+            pass
+    deny(f"cannot safely resolve dynamic executable `{token}`. Allowed next step: name the permitted executable literally so it can be checked; no route is granted to run a blocked executable.")
+
+
 def resolve_executable(token: str, variables: dict[str, str], blocked_names: Iterable[str]) -> str:
     blocked = frozenset(blocked_names)
     # A quoted word is neither brace-expanded nor globbed; its text is the name
@@ -536,6 +568,9 @@ def resolve_executable(token: str, variables: dict[str, str], blocked_names: Ite
     # apply to it again.
     literal = getattr(token, "literal", False)
     seen = set()
+    cli_match = VARIABLE_REF.fullmatch(token)
+    if cli_match and (cli_match.group(1) or cli_match.group(2)) == CLI_PATH_VARIABLE:
+        token, literal = resolve_cli_path(token, variables), True
     while True:
         match = VARIABLE_REF.fullmatch(token)
         if not match:
@@ -1018,6 +1053,14 @@ def walk(
         arithmetic_assignments = {}
     if arithmetic_seen is None:
         arithmetic_seen = set()
+    # Conservative taint scan: quote/escape spelling must not hide a write or
+    # source. It affects only the special runtime reference, never other
+    # variable resolution. Nested strings are rescanned as wrappers unwrap them.
+    taint_text = join_line_continuations(command)
+    if CLI_PATH_WRITE.search(taint_text) or CLI_PATH_WRITE.search(
+        taint_text.translate(str.maketrans("", "", "'\"\\"))
+    ):
+        variables[CLI_PATH_TAINT] = "1"
     shell_bodies: list[str] = []
     command, expanding_bodies = strip_heredocs(command, shell_bodies)
     # This record is intentionally separate from `variables`: it contains all
